@@ -7,7 +7,7 @@
 
 # Runtime state (audit log, halt flag, cached data)
 .vito/
-data/
+/data/
 
 # Python
 .venv/

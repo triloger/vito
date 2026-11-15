@@ -43,3 +43,14 @@ jobs:
             echo "::error::.env is tracked"
             exit 1
           fi
+
+      - name: Every package is tracked
+        run: |
+          fail=0
+          while read -r f; do
+            git ls-files --error-unmatch "$f" >/dev/null 2>&1 || {
+              echo "::error::$f exists but is not tracked (gitignore too broad?)"
+              fail=1
+            }
+          done < <(find src/vito -name '__init__.py')
+          exit $fail
