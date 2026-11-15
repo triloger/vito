@@ -1,0 +1,80 @@
+# =============================================================================
+#  Vito risk policy — "the constitution"
+#
+#  Every order must pass `vito.risk.limits.size_position()`, which reads this
+#  file. A breach raises; it is never downgraded to a warning.
+#
+#  Editing this file changes the policy digest, which invalidates the
+#  live-execution confirmation. That is intentional: risk parameters are not
+#  allowed to drift silently.
+#
+#  See docs/risk-policy.md for the reasoning behind every number.
+# =============================================================================
+
+version = "1.1"
+
+# Below this equity, Vito refuses to open new positions and says so loudly.
+equity_floor_usdt = 50.0
+
+[risk]
+# Loss at the stop, as a percent of equity. The single most important number.
+risk_per_trade_pct = 1.5
+
+# Larger allowance for high-conviction setups, BTC only.
+conviction_risk_pct = 2.0
+
+# Ceiling on notional/equity per position. Note: with risk-based sizing this
+# rarely binds — position size is set by risk / stop distance, not by leverage.
+max_leverage = 6.0
+
+# Total notional across all positions, as a multiple of equity. This is gap
+# risk, not leverage: at 3x a 33% adverse gap is unrecoverable.
+max_gross_exposure_mult = 3.0
+
+max_open_positions = 2
+
+# Stops tighter than this are noise, not signal. Expressed in percent.
+min_stop_distance_pct = 0.6
+
+# Liquidation must sit at least this many stop-widths away, so the stop always
+# fires before the exchange does.
+liquidation_buffer_mult = 5.0
+
+# Reject any fill worse than this from mid. Percent.
+max_slippage_pct = 0.15
+
+# OKX tier-1 maintenance margin rate for BTC/ETH swaps (approximate).
+maintenance_margin_rate = 0.004
+
+# No perp entry within this many minutes of a funding timestamp.
+funding_guard_minutes = 15
+
+[limits]
+# Aggregate loss in a rolling 24h that halts trading.
+daily_loss_halt_pct = 3.0
+
+# Drawdown from peak equity that stops everything until manually reset.
+peak_drawdown_stop_pct = 15.0
+
+# Consecutive losing trades that trigger a cooldown.
+loss_streak_cooldown = 4
+cooldown_hours = 24
+
+[instruments]
+allowed = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "BTC-USDT", "ETH-USDT"]
+# Only these may use the conviction risk tier.
+conviction_allowed = ["BTC-USDT-SWAP"]
+
+[execution]
+# readonly | paper | live
+mode = "readonly"
+
+# Live mode requires the operator to confirm the policy digest at arm time.
+require_policy_hash_confirm = true
+
+kill_switch_file = "~/.vito/HALT"
+audit_log = "~/.vito/audit.jsonl"
+
+# Nobody should ever flip this in a config file. It exists so that a stray
+# edit cannot arm the executor; `vito arm` is the only supported path.
+allow_live_from_config = false

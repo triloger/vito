@@ -1,0 +1,11 @@
+# Non-secret settings. Copy to config/config.toml to override.
+# Secrets live in .env and are never written here.
+
+[market]
+# Instruments Vito watches by default.
+symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
+spot_symbols = ["BTC-USDT", "ETH-USDT"]
+
+[ui]
+# Refuse to render tables narrower than this.
+min_width = 80
