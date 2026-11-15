@@ -6,6 +6,15 @@
 symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
 spot_symbols = ["BTC-USDT", "ETH-USDT"]
 
+[network]
+# The egress IP that OKX sees — i.e. the value you paste into the API key's
+# allowlist. Leave empty to disable the drift check.
+#
+# On a residential connection this changes without warning; `vito doctor` and
+# `vito net` will tell you before OKX rejects the key. Prefer a static address
+# (see docs/okx-setup.md).
+expected_egress_ip = ""
+
 [ui]
 # Refuse to render tables narrower than this.
 min_width = 80

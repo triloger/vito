@@ -72,6 +72,7 @@ def load_credentials() -> Credentials:
 class Settings:
     symbols: tuple[str, ...]
     spot_symbols: tuple[str, ...]
+    expected_egress_ip: str = ""
     min_width: int = 80
 
 
@@ -91,8 +92,10 @@ def load_settings(root: Path | None = None) -> Settings:
     raw = tomllib.loads(path.read_text())
     market = raw.get("market", {})
     ui = raw.get("ui", {})
+    network = raw.get("network", {})
     return Settings(
         symbols=tuple(market.get("symbols", DEFAULT_SYMBOLS)),
         spot_symbols=tuple(market.get("spot_symbols", DEFAULT_SPOT)),
+        expected_egress_ip=str(network.get("expected_egress_ip", "") or ""),
         min_width=int(ui.get("min_width", 80)),
     )

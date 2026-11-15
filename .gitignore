@@ -5,6 +5,9 @@
 *.pem
 *.key
 
+# Local settings (may contain your egress IP; keep it out of a public repo)
+config/config.toml
+
 # Runtime state (audit log, halt flag, cached data)
 .vito/
 /data/

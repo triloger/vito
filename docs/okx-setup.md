@@ -76,12 +76,60 @@ Expected:
 Then:
 
 ```bash
-vito status
+vito net        # what egress IP does OKX see?
+vito doctor     # includes the allowlist drift check
+vito status     # holdings
 ```
 
 The **Account** panel should show your holdings valued in USDT, with a cash
 percentage. An `unpriced` tag means Vito could not find a spot pair for that
 currency — the total is then understated rather than silently wrong.
+
+## Static egress IP
+
+A residential connection changes address without warning. When it does, OKX
+starts rejecting the key and you find out at the worst moment. Two options:
+
+**Check, and re-key when it drifts.** Fine for a read-only key:
+
+```bash
+vito net        # exit 1 on drift; also surfaced by `vito doctor`
+```
+
+**Move to a static address.** Required before the key gets Trade permission.
+
+```bash
+# reserve the address — the value you paste into OKX
+gcloud compute addresses create vito-static --region=us-central1
+gcloud compute addresses describe vito-static --region=us-central1 --format='get(address)'
+
+# a small VM that owns it (free-tier eligible)
+gcloud compute instances create vito \
+  --zone=us-central1-a \
+  --machine-type=e2-micro \
+  --image-family=ubuntu-2404-lts-amd64 \
+  --image-project=ubuntu-os-cloud \
+  --boot-disk-size=30GB \
+  --address=vito-static
+
+# SSH only from where you actually are
+gcloud compute firewall-rules create vito-ssh \
+  --allow=tcp:22 --source-ranges="$(curl -s https://api.ipify.org)/32"
+```
+
+Then Vito runs on that VM and `config/config.toml` gets:
+
+```toml
+[network]
+expected_egress_ip = "34.x.x.x"
+```
+
+A static IP is free while attached to a **running** instance; it bills at about
+$0.01/hour if you stop the VM. Either keep it up or release it.
+
+Serverless (Cloud Run / Functions) has no stable egress unless you add
+Serverless VPC Access + Cloud Router + Cloud NAT (~$32/month), which is the wrong
+trade on a $200 account.
 
 ## 5. Demo trading (recommended before live)
 

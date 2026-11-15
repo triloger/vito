@@ -95,6 +95,7 @@ tells you how to connect an account.
 ```bash
 vito status     # market context + account snapshot
 vito policy     # the constitution and its digest
+vito net        # egress IP and allowlist drift
 vito doctor     # environment, connectivity, credentials
 ```
 
@@ -157,13 +158,14 @@ src/vito/
   data/            market context: price, funding, spread
   portfolio/       account snapshot and valuation
   strategy/        signal interface (pure functions)
+  network.py       egress IP + allowlist drift detection
   backtest/        event-driven engine            [phase 2]
   paper/           paper broker                   [phase 2]
   exec/            order router + hash-chained audit log
-  cli.py           vito status | policy | doctor
+  cli.py           vito status | policy | net | doctor
 docs/              architecture, risk policy, OKX setup, journal
 config/            policy.toml, config.example.toml
-tests/             54 tests, no network required
+tests/             78 tests, no network required
 ```
 
 ## License

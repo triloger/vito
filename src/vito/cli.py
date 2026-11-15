@@ -27,6 +27,7 @@ from vito import __version__
 from vito.config import load_credentials, load_settings, repo_root
 from vito.data.market import MarketRow, market_rows
 from vito.exchange.okx import ExchangeUnavailable, MissingCredentials, OkxGateway
+from vito.network import EgressStatus, check_egress, fetch_egress_ip
 from vito.policy import Policy, PolicyError, load_policy
 from vito.portfolio.snapshot import Snapshot, build_snapshot
 from vito.risk import kill_switch_engaged
@@ -336,6 +337,28 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     checks.append(_check("okx reachable", reachable, "api/v5" if reachable else "no response"))
     failures += not reachable
 
+    settings = load_settings(repo_root())
+    egress = fetch_egress_ip()
+    status = check_egress(settings.expected_egress_ip, egress.ip)
+    if status is EgressStatus.MATCH:
+        checks.append(_check("egress ip", True, f"{egress.ip} matches allowlist"))
+    elif status is EgressStatus.MISMATCH:
+        checks.append(
+            _check(
+                "egress ip",
+                False,
+                f"{egress.ip} != {settings.expected_egress_ip} — update the OKX allowlist",
+            )
+        )
+        failures += 1
+    elif status is EgressStatus.UNCONFIGURED:
+        checks.append(
+            _check("egress ip", None, f"{egress.ip or 'unknown'} · allowlist not configured")
+        )
+    else:
+        checks.append(_check("egress ip", False, egress.error or "unreachable"))
+        failures += 1
+
     if policy is not None:
         halt_path = Path(policy.execution.kill_switch_file).expanduser()
         engaged = halt_path.exists()
@@ -370,6 +393,62 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# net
+# ---------------------------------------------------------------------------
+
+
+def cmd_net(args: argparse.Namespace) -> int:
+    settings = load_settings(repo_root())
+    egress = fetch_egress_ip()
+    status = check_egress(settings.expected_egress_ip, egress.ip)
+
+    if args.json:
+        console.print_json(
+            json.dumps(
+                {
+                    "egress_ip": egress.ip,
+                    "provider": egress.provider,
+                    "expected": settings.expected_egress_ip or None,
+                    "status": str(status),
+                    "error": egress.error,
+                }
+            )
+        )
+    else:
+        if egress.ok:
+            console.print(
+                f"egress ip  [bold]{egress.ip}[/bold]  [dim]({egress.provider})[/dim]"
+            )
+        else:
+            console.print(f"egress ip  [red]unavailable[/red]  [dim]{egress.error}[/dim]")
+
+        if status is EgressStatus.MATCH:
+            console.print(f"allowlist  [green]match[/green]  {settings.expected_egress_ip}")
+        elif status is EgressStatus.MISMATCH:
+            console.print(
+                f"allowlist  [red]drift[/red]  configured {settings.expected_egress_ip}, "
+                f"actual {egress.ip}"
+            )
+            console.print(
+                "[yellow]OKX will reject this key. Update the allowlist, or move to a "
+                "static egress IP (docs/okx-setup.md).[/yellow]"
+            )
+        elif status is EgressStatus.UNCONFIGURED:
+            console.print(
+                "allowlist  [yellow]not configured[/yellow]  set "
+                "\\[network].expected_egress_ip in config/config.toml"
+            )
+        else:
+            console.print("allowlist  [red]unknown[/red]")
+
+    if status is EgressStatus.MISMATCH:
+        return 1
+    if status is EgressStatus.UNREACHABLE:
+        return 2
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # entry point
 # ---------------------------------------------------------------------------
 
@@ -397,6 +476,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser("doctor", help="check environment, connectivity, credentials")
     doctor.set_defaults(func=cmd_doctor)
+
+    net = sub.add_parser("net", help="show egress IP and whether it matches the allowlist")
+    net.add_argument("--json", action="store_true", help="machine-readable output")
+    net.set_defaults(func=cmd_net)
 
     return parser
 
