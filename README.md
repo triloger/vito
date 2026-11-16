@@ -99,6 +99,7 @@ vito net        # egress IP and allowlist drift
 vito doctor     # environment, connectivity, credentials
 vito backtest   # run a strategy over real OKX candles
 vito walkforward # choose parameters on the past, score them on the future
+vito paper step  # run the executor against live prices, risk-free
 ```
 
 or without installing: `python -m vito status`.
@@ -165,6 +166,23 @@ sample to call it dead. No configuration in this library has demonstrated
 out-of-sample edge, so the live gate stays shut and the next step is paper, not
 capital. That is the correct outcome to discover with paper money.
 
+### Paper trading
+
+```bash
+vito paper step --symbol BTC-USDT-SWAP --timeframe 1d --strategy breakout
+vito paper status
+```
+
+A single idempotent step, meant for cron or a systemd timer: fetch the newest
+closed candle, apply any bars the watermark has not seen, write state atomically.
+It uses the same sizing function and fill rules as the backtester — asserted
+round-for-round in `tests/test_paper.py` — so the two cannot drift apart.
+
+Paper models bar-close decisions, next-open fills, fees, slippage and intrabar
+stops. It does **not** model funding, spread widening, partial fills or latency.
+Treat paper PnL as a plumbing signal. See [`docs/paper.md`](docs/paper.md),
+including the systemd timer.
+
 ### Connecting an account (read-only first)
 
 Vito is read-only until you deliberately promote it. To see balances:
@@ -187,8 +205,8 @@ sub-account strategy and why the passphrase matters:
 | **0** ✅ | Repo, policy, docs, CI | — |
 | **1** ✅ | Read-only dashboard | `vito doctor` clean |
 | **2** ✅ | Backtester + walk-forward | ❌ failed: no out-of-sample edge, live stays off |
-| **2b** | Paper broker | ≥200 paper trades or 30 days positive |
-| **3** | Guarded live routing | 7 days shadow-diffed against live |
+| **2b** ✅ | Paper broker | plumbing proven; PnL is not evidence of edge |
+| **3** | Shadow mode + guarded live routing | 7 days shadow-diffed against live |
 | **4** | Daily report, journal, rebalance | — |
 | **5** | Options, multi-instrument | Only if account equity justifies contract minimums |
 
@@ -218,12 +236,12 @@ src/vito/
   strategy/        indicators + trend / breakout / meanrev (pure functions)
   network.py       egress IP + allowlist drift detection
   backtest/        event-driven engine + walk-forward validation
-  paper/           paper broker                   [phase 2b]
+  paper/           step-driven paper broker, atomic state
   exec/            order router + hash-chained audit log
-  cli.py           status | policy | net | doctor | backtest | walkforward
-docs/              architecture, risk policy, OKX setup, journal
+  cli.py           status | policy | net | doctor | backtest | walkforward | paper
+docs/              architecture, risk policy, OKX setup, paper, journal
 config/            policy.toml, config.example.toml
-tests/             107 tests, no network required
+tests/             121 tests, no network required
 ```
 
 ## License

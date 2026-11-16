@@ -48,7 +48,7 @@ caller to have checked the policy.
 | `backtest/engine.py` | Event-driven replay: costs, funding, gap fills | **none** |
 | `backtest/walkforward.py` | Rolling train/test selection, chained OOS equity | **none** |
 | `data/ohlcv.py` | Paginated candles + funding, cached on disk | network, filesystem |
-| `paper/` | Paper broker | Phase 2b — not implemented |
+| `paper/broker.py` | Step-driven paper broker, atomic JSON state | filesystem |
 | `exec/` | `OrderRouter` (locked), `AuditLog` (hash-chained) | filesystem, later network |
 | `cli.py` | Presentation only | stdout |
 

@@ -35,6 +35,48 @@ def _cache_path(kind: str, inst_id: str, timeframe: str, days: int) -> Path:
     return CACHE_DIR / f"{kind}_{inst_id}_{timeframe}_{days}d.csv"
 
 
+def fetch_recent(
+    gateway: OkxGateway,
+    inst_id: str,
+    *,
+    timeframe: str = "1d",
+    limit: int = 500,
+) -> pd.DataFrame:
+    """The most recent bars, uncached.
+
+    Paper trading has to see the newest close on every run, so caching here would
+    be a bug: a stale file is indistinguishable from a quiet market.
+    """
+    market = gateway._market(inst_id)  # noqa: SLF001 - same package
+    rows = gateway.client.fetch_ohlcv(market["symbol"], timeframe=timeframe, limit=limit)
+    return _frame(rows)
+
+
+def closed_only(frame: pd.DataFrame, timeframe: str, *, now_ms: int | None = None) -> pd.DataFrame:
+    """Drop the still-forming candle.
+
+    Exchanges return the in-progress bar as the last row. Acting on it means
+    acting on a price that has not closed, which is the live version of
+    lookahead.
+    """
+    if frame.empty:
+        return frame
+    now = now_ms if now_ms is not None else int(time.time() * 1000)
+    closes_at = frame["timestamp"].astype("int64") + TIMEFRAME_MS[timeframe]
+    return frame.loc[closes_at <= now].reset_index(drop=True)
+
+
+def _frame(rows: list[list[float]]) -> pd.DataFrame:
+    frame = pd.DataFrame(
+        rows, columns=["timestamp", "open", "high", "low", "close", "volume"]
+    )
+    return (
+        frame.drop_duplicates(subset="timestamp")
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
+
+
 def fetch_candles(
     gateway: OkxGateway,
     inst_id: str,
@@ -66,14 +108,7 @@ def fetch_candles(
         if len(batch) < 100:
             break
 
-    frame = pd.DataFrame(
-        rows, columns=["timestamp", "open", "high", "low", "close", "volume"]
-    )
-    frame = (
-        frame.drop_duplicates(subset="timestamp")
-        .sort_values("timestamp")
-        .reset_index(drop=True)
-    )
+    frame = _frame(rows)
     frame.to_csv(path, index=False)
     return frame
 

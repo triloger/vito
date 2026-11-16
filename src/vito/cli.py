@@ -31,9 +31,16 @@ from vito.backtest import buy_and_hold, run_backtest
 from vito.backtest.walkforward import fold_table, oos_buy_and_hold, walk_forward
 from vito.config import load_credentials, load_settings, repo_root
 from vito.data.market import MarketRow, market_rows
-from vito.data.ohlcv import TIMEFRAME_MS, fetch_candles, fetch_funding
+from vito.data.ohlcv import (
+    TIMEFRAME_MS,
+    closed_only,
+    fetch_candles,
+    fetch_funding,
+    fetch_recent,
+)
 from vito.exchange.okx import ExchangeUnavailable, MissingCredentials, OkxGateway
 from vito.network import EgressStatus, check_egress, fetch_egress_ip
+from vito.paper import PaperBroker, load_state
 from vito.policy import Policy, PolicyError, load_policy
 from vito.portfolio.snapshot import Snapshot, build_snapshot
 from vito.risk import kill_switch_engaged
@@ -634,6 +641,148 @@ def cmd_walkforward(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# paper
+# ---------------------------------------------------------------------------
+
+
+def _parse_params(values: list[str] | None) -> dict[str, object]:
+    out: dict[str, object] = {}
+    for item in values or []:
+        if "=" not in item:
+            raise SystemExit(f"--param expects key=value, got {item!r}")
+        key, raw = item.split("=", 1)
+        try:
+            out[key] = int(raw)
+        except ValueError:
+            try:
+                out[key] = float(raw)
+            except ValueError:
+                out[key] = raw
+    return out
+
+
+def cmd_paper_step(args: argparse.Namespace) -> int:
+    policy = load_policy(args.policy)
+    gateway = OkxGateway(load_credentials())
+
+    with console.status(f"fetching {args.symbol} {args.timeframe}…", spinner="dots"):
+        raw = fetch_recent(gateway, args.symbol, timeframe=args.timeframe, limit=args.bars)
+        candles = closed_only(raw, args.timeframe)
+
+    if candles.empty:
+        console.print("[red]no closed candles returned[/red]")
+        return 2
+
+    broker = PaperBroker(
+        policy=policy,
+        inst_id=args.symbol,
+        strategy=args.strategy,
+        timeframe=args.timeframe,
+        initial_equity=args.initial,
+        fee_bps=args.fee_bps,
+        params=_parse_params(args.param),
+        state_path=Path(args.state).expanduser() if args.state else None,
+    )
+    if args.reset:
+        broker.reset()
+
+    report = broker.step(candles)
+    summary = report.state.summary()
+
+    if args.json:
+        console.print_json(
+            json.dumps(
+                {
+                    "status": report.status,
+                    "bars_processed": report.bars_processed,
+                    "actions": list(report.actions),
+                    "marked_equity": round(report.marked_equity, 2),
+                    "state_file": str(broker.state_path),
+                    **summary,
+                },
+                default=str,
+            )
+        )
+        return 0
+
+    console.print(_header(policy))
+    console.print(
+        f"[bold]{args.symbol}[/bold] {args.timeframe} · {args.strategy} · "
+        f"paper · start {_money(args.initial)} USDT"
+    )
+
+    if report.status == "warmed_up":
+        console.print(
+            "[dim]warmed up on history — no position taken. The next closed bar "
+            "is the first one that can trade.[/dim]"
+        )
+    elif report.status == "no_new_bar":
+        console.print("[dim]no new closed bar since the last step[/dim]")
+    else:
+        console.print(f"[dim]{report.bars_processed} new bar(s) processed[/dim]")
+
+    for action in report.actions:
+        colour = "green" if action.startswith("open") else "yellow"
+        console.print(f"  [{colour}]{action}[/{colour}]")
+
+    if report.state.position:
+        pos = report.state.position
+        console.print(
+            f"  open {pos['side']} {pos['notional']:.2f} USDT @ "
+            f"{pos['entry_price']:.2f} · stop {pos['stop']:.2f}"
+        )
+
+    console.print(
+        f"equity [bold]{_money(summary['equity'])}[/bold] USDT · "
+        f"{summary['return_pct']:+.2f}% · {summary['trades']} trades · "
+        f"fees {summary['fees_paid']:.2f}"
+    )
+    console.print(f"[dim]state: {broker.state_path}[/dim]")
+    return 0
+
+
+def cmd_paper_status(args: argparse.Namespace) -> int:
+    if args.state:
+        paths = [Path(args.state).expanduser()]
+    else:
+        paths = sorted(Path("~/.vito").expanduser().glob("paper-*.json"))
+
+    if not paths:
+        console.print("[dim]no paper runs yet — start one with `vito paper step`[/dim]")
+        return 0
+
+    rows = []
+    for path in paths:
+        state = load_state(path)
+        if state is None:
+            continue
+        summary = state.summary()
+        rows.append({"file": path.name, **summary})
+
+    if args.json:
+        console.print_json(json.dumps(rows, default=str))
+        return 0
+
+    table = Table(title="Paper runs", title_justify="left", header_style="bold")
+    for column in ("Run", "Equity", "Return", "Trades", "Win", "Fees", "Position"):
+        table.add_column(column, justify="left" if column == "Run" else "right")
+
+    for row in rows:
+        position = row["position"]["side"] if row.get("position") else "flat"
+        table.add_row(
+            f"{row['inst_id']} {row['strategy']} {row['timeframe']}",
+            _money(float(row["equity"])),
+            _signed_pct(float(row["return_pct"])),
+            str(int(row["trades"])),
+            f"{float(row['win_rate_pct']):.0f}%",
+            f"{float(row['fees_paid']):.2f}",
+            position,
+        )
+    console.print(table)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # net
 # ---------------------------------------------------------------------------
 
@@ -757,6 +906,27 @@ def build_parser() -> argparse.ArgumentParser:
     wf.add_argument("--refresh", action="store_true", help="ignore cached candles")
     wf.add_argument("--json", action="store_true", help="machine-readable output")
     wf.set_defaults(func=cmd_walkforward)
+
+    paper = sub.add_parser("paper", help="paper trading against live prices")
+    paper_sub = paper.add_subparsers(dest="paper_command", required=True)
+
+    step = paper_sub.add_parser("step", help="apply any newly closed bars")
+    step.add_argument("--symbol", default="BTC-USDT-SWAP")
+    step.add_argument("--timeframe", default="1d", choices=sorted(TIMEFRAME_MS))
+    step.add_argument("--strategy", default="breakout", choices=[*STRATEGIES])
+    step.add_argument("--param", action="append", help="strategy parameter, key=value")
+    step.add_argument("--initial", type=float, default=200.0, help="starting equity in USDT")
+    step.add_argument("--fee-bps", type=float, default=5.0, help="taker fee per side")
+    step.add_argument("--bars", type=int, default=500, help="candles fetched for warm-up")
+    step.add_argument("--state", default=None, help="state file (default: ~/.vito/paper-*.json)")
+    step.add_argument("--reset", action="store_true", help="delete the run before stepping")
+    step.add_argument("--json", action="store_true", help="machine-readable output")
+    step.set_defaults(func=cmd_paper_step)
+
+    show = paper_sub.add_parser("status", help="show paper runs")
+    show.add_argument("--state", default=None, help="state file to inspect")
+    show.add_argument("--json", action="store_true", help="machine-readable output")
+    show.set_defaults(func=cmd_paper_status)
 
     return parser
 
