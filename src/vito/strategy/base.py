@@ -1,14 +1,15 @@
 """Strategy interface.
 
-Strategies are pure functions over market data. They emit *signals*, never
-orders — the risk layer decides whether a signal is actionable. Keeping them
-side-effect free is what makes them backtestable and testable.
+A strategy is a pure function of history: it turns candles into a per-bar frame
+of *intent*. It never sees the future, never sizes a position, and never places
+an order — the engine and the risk policy decide the rest.
+
+Signals are computed on the close of bar *i* and acted on at the open of bar
+*i+1*, which is why the engine cannot accidentally use same-bar information.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
@@ -21,26 +22,19 @@ class Side(StrEnum):
     FLAT = "flat"
 
 
-@dataclass(frozen=True, slots=True)
-class Signal:
-    """A proposed trade idea, before sizing."""
-
-    inst_id: str
-    side: Side
-    stop_distance: float  # fraction of price: 0.01 == 1%
-    conviction: bool = False
-    reason: str = ""
+SIGNAL_COLUMNS = ("side", "stop_distance", "conviction")
 
 
 class Strategy(Protocol):
-    """A strategy turns candles into signals."""
+    """Turns candles into a signal frame aligned with the candle index."""
 
     name: str
 
-    def generate(self, inst_id: str, candles: pd.DataFrame) -> Sequence[Signal]:
-        """Return zero or more signals for the most recent bar.
+    def signals(self, inst_id: str, candles: pd.DataFrame) -> pd.DataFrame:
+        """Return columns ``side``, ``stop_distance``, ``conviction``.
 
-        ``candles`` is expected to have columns ``timestamp, open, high, low,
-        close, volume`` in ascending time order.
+        ``side`` is ``long``/``short``/``flat``; ``stop_distance`` is a fraction
+        of price (0.01 == 1%); ``conviction`` opts into the policy's higher risk
+        tier where the instrument allows it.
         """
         ...

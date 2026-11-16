@@ -24,13 +24,16 @@ from rich.panel import Panel
 from rich.table import Table
 
 from vito import __version__
+from vito.backtest import buy_and_hold, run_backtest
 from vito.config import load_credentials, load_settings, repo_root
 from vito.data.market import MarketRow, market_rows
+from vito.data.ohlcv import TIMEFRAME_MS, fetch_candles, fetch_funding
 from vito.exchange.okx import ExchangeUnavailable, MissingCredentials, OkxGateway
 from vito.network import EgressStatus, check_egress, fetch_egress_ip
 from vito.policy import Policy, PolicyError, load_policy
 from vito.portfolio.snapshot import Snapshot, build_snapshot
 from vito.risk import kill_switch_engaged
+from vito.strategy import STRATEGIES, build
 
 console = Console()
 
@@ -393,6 +396,127 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# backtest
+# ---------------------------------------------------------------------------
+
+
+def cmd_backtest(args: argparse.Namespace) -> int:
+    policy = load_policy(args.policy)
+    gateway = OkxGateway(load_credentials())
+
+    with console.status(f"fetching {args.symbol} {args.timeframe}…", spinner="dots"):
+        candles = fetch_candles(
+            gateway, args.symbol, timeframe=args.timeframe, days=args.days, refresh=args.refresh
+        )
+        funding = None
+        if args.symbol.endswith("-SWAP"):
+            funding = fetch_funding(
+                gateway, args.symbol, days=args.days, refresh=args.refresh
+            )
+
+    if candles.empty:
+        console.print("[red]no candles returned[/red]")
+        return 2
+
+    span_start = datetime.fromtimestamp(int(candles["timestamp"].iloc[0]) / 1000)
+    span_end = datetime.fromtimestamp(int(candles["timestamp"].iloc[-1]) / 1000)
+
+    names = list(STRATEGIES) if args.strategy == "all" else [args.strategy]
+    results: dict[str, dict] = {}
+
+    for name in names:
+        signals = build(name).signals(args.symbol, candles)
+        result = run_backtest(
+            candles,
+            signals,
+            inst_id=args.symbol,
+            strategy_name=name,
+            policy=policy,
+            initial_equity=args.initial,
+            fee_bps=args.fee_bps,
+            funding=funding,
+            timeframe=args.timeframe,
+        )
+        results[name] = {**result.metrics, "skipped": result.skipped}
+
+    benchmark = buy_and_hold(candles, initial_equity=args.initial, timeframe=args.timeframe)
+
+    if args.json:
+        console.print_json(
+            json.dumps(
+                {
+                    "symbol": args.symbol,
+                    "timeframe": args.timeframe,
+                    "bars": len(candles),
+                    "from": span_start.isoformat(),
+                    "to": span_end.isoformat(),
+                    "reduce_only": True,
+                    "strategies": results,
+                    "buy_and_hold": benchmark,
+                },
+                default=str,
+            )
+        )
+        return 0
+
+    console.print(_header(policy))
+    console.print(
+        f"[bold]{args.symbol}[/bold] {args.timeframe} · {len(candles)} bars · "
+        f"{span_start:%Y-%m-%d} → {span_end:%Y-%m-%d} · "
+        f"start {_money(args.initial)} USDT"
+    )
+
+    table = Table(title="Backtest", title_justify="left", header_style="bold")
+    for column in ("Strategy", "Return", "CAGR", "Max DD", "Sharpe", "Trades", "Win", "PF", "ExpR"):
+        table.add_column(column, justify="right" if column != "Strategy" else "left")
+
+    for name, m in results.items():
+        table.add_row(
+            name,
+            _signed_pct(float(m["total_return_pct"])),
+            _signed_pct(float(m["cagr_pct"])),
+            f"[red]{float(m['max_drawdown_pct']):.1f}%[/red]",
+            f"{float(m['sharpe']):.2f}",
+            str(int(m["trades"])),
+            f"{float(m['win_rate_pct']):.0f}%",
+            f"{float(m['profit_factor']):.2f}",
+            f"{float(m['expectancy_r']):+.2f}",
+        )
+    table.add_section()
+    table.add_row(
+        "[dim]buy & hold[/dim]",
+        f"[dim]{float(benchmark['total_return_pct']):+.2f}%[/dim]",
+        f"[dim]{float(benchmark['cagr_pct']):+.2f}%[/dim]",
+        f"[dim]{float(benchmark['max_drawdown_pct']):.1f}%[/dim]",
+        f"[dim]{float(benchmark['sharpe']):.2f}[/dim]",
+        "[dim]—[/dim]",
+        "[dim]—[/dim]",
+        "[dim]—[/dim]",
+        "[dim]—[/dim]",
+    )
+    console.print(table)
+
+    for name, m in results.items():
+        skipped = m.get("skipped") or {}
+        if skipped:
+            detail = ", ".join(f"{k}×{v}" for k, v in sorted(skipped.items()))
+            console.print(f"[dim]{name}: refused by policy — {detail}[/dim]")
+
+    console.print(
+        "[dim]fees "
+        + " · ".join(
+            f"{n} {_money(float(m['fees_paid']))}" for n, m in results.items()
+        )
+        + " USDT · funding "
+        + " · ".join(
+            f"{n} {_money(float(m['funding_paid']))}" for n, m in results.items()
+        )
+        + " USDT[/dim]"
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # net
 # ---------------------------------------------------------------------------
 
@@ -480,6 +604,17 @@ def build_parser() -> argparse.ArgumentParser:
     net = sub.add_parser("net", help="show egress IP and whether it matches the allowlist")
     net.add_argument("--json", action="store_true", help="machine-readable output")
     net.set_defaults(func=cmd_net)
+
+    bt = sub.add_parser("backtest", help="run a strategy over historical candles")
+    bt.add_argument("--symbol", default="BTC-USDT-SWAP")
+    bt.add_argument("--timeframe", default="4h", choices=sorted(TIMEFRAME_MS))
+    bt.add_argument("--days", type=int, default=730)
+    bt.add_argument("--strategy", default="all", choices=[*STRATEGIES, "all"])
+    bt.add_argument("--initial", type=float, default=200.0, help="starting equity in USDT")
+    bt.add_argument("--fee-bps", type=float, default=5.0, help="taker fee per side")
+    bt.add_argument("--refresh", action="store_true", help="ignore cached candles")
+    bt.add_argument("--json", action="store_true", help="machine-readable output")
+    bt.set_defaults(func=cmd_backtest)
 
     return parser
 

@@ -97,6 +97,7 @@ vito status     # market context + account snapshot
 vito policy     # the constitution and its digest
 vito net        # egress IP and allowlist drift
 vito doctor     # environment, connectivity, credentials
+vito backtest   # run a strategy over real OKX candles
 ```
 
 or without installing: `python -m vito status`.
@@ -107,6 +108,35 @@ annualised cost), the account holdings valued in USDT, and the active guards.
 ```bash
 vito status --json    # machine-readable, for dashboards or cron
 ```
+
+### Backtesting
+
+```bash
+vito backtest --symbol BTC-USDT-SWAP --timeframe 1d --days 730
+vito backtest --symbol ETH-USDT-SWAP --timeframe 4h --strategy trend --json
+```
+
+The engine pays taker fees on both legs, slippage on both legs, and funding
+every interval while a perpetual is open. Entries execute at the **next** bar's
+open, stops are checked intrabar and fill at the open when a bar gaps through
+them, and every entry is sized by the same `size_position` the live router uses —
+so a backtest cannot be more aggressive than the executor.
+
+Results over 2024-11 → 2026-11 (BTC, 200 USDT, 5 bps):
+
+| Symbol | TF | Strategy | Return | Max DD | Sharpe | Trades | Fees |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| BTC | 1d | breakout | +8.5% | −5.0% | 0.90 | 44 | 2.49 |
+| BTC | 1d | trend | +1.1% | −11.8% | 0.10 | 30 | 1.71 |
+| BTC | 4h | trend | +0.5% | −21.9% | 0.14 | 222 | 27.10 |
+| BTC | 4h | meanrev | −25.1% | −27.5% | −1.60 | 200 | 18.67 |
+| BTC | 4h | buy & hold | −28.6% | −53.4% | −0.17 | — | — |
+
+The headline is not a return. It is that **fees on 222 trades cost 27 USDT —
+13.5% of a 200 USDT account — while 44 trades cost 2.49.** Frequency, not signal
+quality, decided the outcome. Treat every number above as in-sample and
+unproven; 44 trades is not a sample, it is an anecdote. See
+[`docs/journal/`](docs/journal/).
 
 ### Connecting an account (read-only first)
 
@@ -129,12 +159,13 @@ sub-account strategy and why the passphrase matters:
 | --- | --- | --- |
 | **0** ✅ | Repo, policy, docs, CI | — |
 | **1** ✅ | Read-only dashboard | `vito doctor` clean |
-| **2** | Backtester + paper broker | Backtest beats buy-and-hold on risk-adjusted return |
-| **3** | Guarded live routing | ≥200 paper trades or 30 days positive, then 7 days shadow-diffed against live |
+| **2** ✅ | Backtester (fees, funding, slippage) | beats buy-and-hold *in sample* — not yet out of sample |
+| **2b** | Paper broker | ≥200 paper trades or 30 days positive |
+| **3** | Guarded live routing | 7 days shadow-diffed against live |
 | **4** | Daily report, journal, rebalance | — |
 | **5** | Options, multi-instrument | Only if account equity justifies contract minimums |
 
-Placeholders for Phase 2+ raise `NotImplementedError` with an explanation rather
+Placeholders for Phase 3+ raise `NotImplementedError` with an explanation rather
 than pretending to work. Nothing in this repository can place an order today.
 
 ## Safety rules (non-negotiable)
@@ -155,17 +186,17 @@ src/vito/
   policy.py        risk constitution: load, validate, digest
   risk/            position sizing + circuit breakers (pure, tested)
   exchange/        OKX gateway (read-only by default)
-  data/            market context: price, funding, spread
+  data/            market context: price, funding, spread, candles
   portfolio/       account snapshot and valuation
-  strategy/        signal interface (pure functions)
+  strategy/        indicators + trend / breakout / meanrev (pure functions)
   network.py       egress IP + allowlist drift detection
-  backtest/        event-driven engine            [phase 2]
-  paper/           paper broker                   [phase 2]
+  backtest/        event-driven engine: fees, funding, slippage, gap fills
+  paper/           paper broker                   [phase 2b]
   exec/            order router + hash-chained audit log
-  cli.py           vito status | policy | net | doctor
+  cli.py           vito status | policy | net | doctor | backtest
 docs/              architecture, risk policy, OKX setup, journal
 config/            policy.toml, config.example.toml
-tests/             78 tests, no network required
+tests/             96 tests, no network required
 ```
 
 ## License
