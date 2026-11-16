@@ -33,3 +33,17 @@ def test_cli_imports_cover_every_module() -> None:
         "vito.paper",
     ):
         assert importlib.import_module(module) is not None
+
+
+def test_write_env_credentials_sets_0600_mode(tmp_path) -> None:
+    import stat
+
+    from vito.config import write_env_credentials
+
+    env_file = write_env_credentials("abcd1234efgh", "sec", "pass", root=tmp_path)
+    assert env_file.exists()
+    mode = stat.S_IMODE(env_file.stat().st_mode)
+    assert mode == 0o600
+    text = env_file.read_text(encoding="utf-8")
+    assert "VITO_OKX_API_KEY=abcd1234efgh" in text
+    assert "VITO_OKX_DEMO=0" in text

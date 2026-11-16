@@ -15,6 +15,7 @@ Nothing here can move funds. Execution is a separate, armed object.
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import platform
 import sys
@@ -30,7 +31,13 @@ from vito import __version__
 from vito.backtest import buy_and_hold, run_backtest
 from vito.backtest.panel import DEFAULT_BASKET, run_panel_momentum
 from vito.backtest.walkforward import fold_table, oos_buy_and_hold, walk_forward
-from vito.config import load_credentials, load_settings, repo_root
+from vito.config import (
+    Credentials,
+    load_credentials,
+    load_settings,
+    repo_root,
+    write_env_credentials,
+)
 from vito.data.instruments import scan_instruments
 from vito.data.market import MarketRow, market_rows
 from vito.data.ohlcv import (
@@ -406,6 +413,53 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     console.print(table)
 
     return 1 if failures else 0
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    """Prompt for OKX credentials with echo disabled and write mode-0600 `.env`."""
+    console.print(
+        Panel(
+            "Enter your [bold]Read-only[/bold] OKX sub-account API credentials.\n"
+            "Input is hidden (nothing is echoed to the terminal or shell history).",
+            title="Vito Setup",
+            title_align="left",
+            border_style="cyan",
+        )
+    )
+    api_key = getpass.getpass("OKX API Key (hidden): ").strip()
+    api_secret = getpass.getpass("OKX API Secret (hidden): ").strip()
+    passphrase = getpass.getpass("OKX Passphrase (hidden): ").strip()
+
+    creds = Credentials(
+        api_key=api_key,
+        api_secret=api_secret,
+        passphrase=passphrase,
+        demo=bool(args.demo),
+    )
+    if not creds.complete:
+        console.print("[red]setup aborted: all three fields are required[/red]")
+        return 1
+
+    env_path = write_env_credentials(
+        api_key, api_secret, passphrase, demo=bool(args.demo)
+    )
+    console.print(
+        f"[green]✓[/green] wrote [cyan]{env_path}[/cyan] (mode 0600) · "
+        f"key [bold]{creds.masked()}[/bold]"
+    )
+
+    gateway = OkxGateway(creds)
+    try:
+        snapshot = build_snapshot(gateway)
+    except ExchangeUnavailable as exc:
+        console.print(f"[yellow]saved .env, but OKX rejected the check:[/yellow] {exc}")
+        return 2
+
+    console.print(
+        f"[green]✓[/green] authenticated with OKX · "
+        f"total equity [bold]{_money(snapshot.total_usdt)}[/bold] USDT"
+    )
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1179,6 +1233,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser("doctor", help="check environment, connectivity, credentials")
     doctor.set_defaults(func=cmd_doctor)
+
+    setup = sub.add_parser(
+        "setup", help="prompt for OKX credentials (hidden input) and write mode-0600 .env"
+    )
+    setup.add_argument("--demo", action="store_true", help="enable OKX demo/sandbox mode")
+    setup.set_defaults(func=cmd_setup)
 
     net = sub.add_parser("net", help="show egress IP and whether it matches the allowlist")
     net.add_argument("--json", action="store_true", help="machine-readable output")
