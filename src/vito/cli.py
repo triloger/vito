@@ -28,6 +28,7 @@ from rich.table import Table
 
 from vito import __version__
 from vito.backtest import buy_and_hold, run_backtest
+from vito.backtest.panel import DEFAULT_BASKET, run_panel_momentum
 from vito.backtest.walkforward import fold_table, oos_buy_and_hold, walk_forward
 from vito.config import load_credentials, load_settings, repo_root
 from vito.data.instruments import scan_instruments
@@ -953,6 +954,118 @@ def cmd_instruments(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# panel
+# ---------------------------------------------------------------------------
+
+
+def cmd_panel(args: argparse.Namespace) -> int:
+    policy = load_policy(args.policy)
+    gateway = OkxGateway(load_credentials())
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+
+    frames = {}
+    min_notional: dict[str, float] = {}
+    with console.status(f"fetching {len(symbols)} instruments ({args.timeframe})…", spinner="dots"):
+        for sym in symbols:
+            try:
+                df = fetch_candles(
+                    gateway, sym, timeframe=args.timeframe, days=args.days, refresh=args.refresh
+                )
+            except ExchangeUnavailable:
+                continue
+            if not df.empty:
+                frames[sym] = df
+            try:
+                min_notional[sym] = gateway.min_notional(sym)
+            except ExchangeUnavailable:
+                min_notional[sym] = 0.0
+
+    if not frames:
+        console.print("[red]no candles returned for basket[/red]")
+        return 2
+
+    try:
+        result = run_panel_momentum(
+            frames,
+            timeframe=args.timeframe,
+            lookback=args.lookback,
+            rebalance_every=args.rebalance_every,
+            max_positions=args.max_positions,
+            max_gross_exposure_mult=args.max_exposure,
+            initial_equity=args.initial,
+            fee_bps=args.fee_bps,
+            min_notional=min_notional,
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return 2
+
+    span_start = result.equity_curve.index[result.lookback]
+    span_end = result.equity_curve.index[-1]
+
+    if args.json:
+        console.print_json(
+            json.dumps(
+                {
+                    "symbols": list(result.symbols),
+                    "timeframe": result.timeframe,
+                    "lookback": result.lookback,
+                    "rebalance_every": result.rebalance_every,
+                    "from": span_start.isoformat(),
+                    "to": span_end.isoformat(),
+                    "metrics": result.metrics,
+                    "equal_weight_benchmark": result.benchmark,
+                    "asset_stats": result.asset_stats,
+                },
+                default=str,
+            )
+        )
+        return 0
+
+    console.print(_header(policy))
+    console.print(
+        f"[bold]Cross-Asset Momentum Panel[/bold] · {len(result.symbols)} instruments · "
+        f"{result.timeframe} · lookback {result.lookback} / "
+        f"rebalance {result.rebalance_every} bars · "
+        f"top {args.max_positions} @ {args.max_exposure:.2f}x gross · "
+        f"{span_start:%Y-%m-%d} → {span_end:%Y-%m-%d}"
+    )
+
+    table = Table(title="Asset Contribution", title_justify="left", header_style="bold")
+    table.add_column("Instrument")
+    table.add_column("Bars Held", justify="right")
+    table.add_column("Time Held", justify="right")
+    table.add_column("Gross PnL (USDT)", justify="right")
+    for sym, st in sorted(
+        result.asset_stats.items(), key=lambda kv: -kv[1]["pnl_usdt"]
+    ):
+        pnl = float(st["pnl_usdt"])
+        col = "green" if pnl > 0 else "red" if pnl < 0 else "white"
+        table.add_row(
+            sym,
+            str(int(st["bars_held"])),
+            f"{st['share_held_pct']:.1f}%",
+            f"[{col}]{pnl:+.2f}[/{col}]",
+        )
+    console.print(table)
+
+    m = result.metrics
+    b = result.benchmark
+    console.print(
+        f"portfolio · return [bold]{m['total_return_pct']:+.2f}%[/bold] "
+        f"(CAGR {m['cagr_pct']:+.2f}%) · max DD [red]{m['max_drawdown_pct']:.1f}%[/red] · "
+        f"sharpe {m['sharpe']:.2f} (t={m['t_stat']:+.2f}) · "
+        f"exposure {m['exposure_pct']:.1f}% · fees {m['fees_paid']:.2f} USDT"
+    )
+    console.print(
+        f"[dim]equal-weight basket buy & hold · return {b['total_return_pct']:+.2f}% "
+        f"(CAGR {b['cagr_pct']:+.2f}%) · max DD {b['max_drawdown_pct']:.1f}% · "
+        f"sharpe {b['sharpe']:.2f} (t={b['t_stat']:+.2f})[/dim]"
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # entry point
 # ---------------------------------------------------------------------------
 
@@ -1050,6 +1163,27 @@ def build_parser() -> argparse.ArgumentParser:
     wf.add_argument("--refresh", action="store_true", help="ignore cached candles")
     wf.add_argument("--json", action="store_true", help="machine-readable output")
     wf.set_defaults(func=cmd_walkforward)
+
+    panel = sub.add_parser(
+        "panel",
+        help="run pre-registered cross-asset momentum across a multi-asset basket",
+    )
+    panel.add_argument(
+        "--symbols",
+        default=",".join(DEFAULT_BASKET),
+        help="comma-separated instrument IDs",
+    )
+    panel.add_argument("--timeframe", default="1d", choices=sorted(TIMEFRAME_MS))
+    panel.add_argument("--days", type=int, default=730)
+    panel.add_argument("--lookback", type=int, default=20)
+    panel.add_argument("--rebalance-every", type=int, default=5)
+    panel.add_argument("--max-positions", type=int, default=2)
+    panel.add_argument("--max-exposure", type=float, default=0.75)
+    panel.add_argument("--initial", type=float, default=200.0)
+    panel.add_argument("--fee-bps", type=float, default=5.0)
+    panel.add_argument("--refresh", action="store_true")
+    panel.add_argument("--json", action="store_true")
+    panel.set_defaults(func=cmd_panel)
 
     paper = sub.add_parser("paper", help="paper trading against live prices")
     paper_sub = paper.add_subparsers(dest="paper_command", required=True)

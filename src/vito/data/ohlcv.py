@@ -101,18 +101,33 @@ def fetch_candles(
 
     rows: list[list[float]] = []
     after_cursor: int | None = None
-    max_pages = max(20, int(days * 86_400_000 / TIMEFRAME_MS[timeframe] / 90) + 5)
+    use_history = False
+    max_pages = max(20, int(days * 86_400_000 / TIMEFRAME_MS[timeframe] / 250) + 10)
 
     for _ in range(max_pages):
-        params = {"after": str(after_cursor)} if after_cursor is not None else {}
+        params: dict[str, str] = {}
+        if after_cursor is not None:
+            params["after"] = str(after_cursor)
+        if use_history:
+            params["type"] = "HistoryCandles"
         batch = gateway.client.fetch_ohlcv(
-            market["symbol"], timeframe=timeframe, limit=100, params=params
+            market["symbol"], timeframe=timeframe, limit=300, params=params
         )
+        if not batch and not use_history and after_cursor is not None:
+            use_history = True
+            params["type"] = "HistoryCandles"
+            batch = gateway.client.fetch_ohlcv(
+                market["symbol"], timeframe=timeframe, limit=300, params=params
+            )
         if not batch:
             break
         rows.extend(batch)
         oldest = int(batch[0][0])
-        if oldest <= since or len(batch) < 100:
+        if oldest <= since:
+            break
+        if len(batch) < 300 and not use_history:
+            use_history = True
+        elif len(batch) < 300 and use_history:
             break
         if after_cursor is not None and oldest >= after_cursor:
             break
