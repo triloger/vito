@@ -477,3 +477,216 @@ class PaperBroker:
 
 def kill_switch_active(policy: Policy) -> bool:
     return kill_switch_engaged(policy.execution.kill_switch_file)
+
+
+class PaperPanelBroker:
+    """Step-driven cross-asset momentum paper broker."""
+
+    def __init__(
+        self,
+        *,
+        policy: Policy,
+        symbols: tuple[str, ...] | list[str],
+        timeframe: str = "1d",
+        lookback: int = 20,
+        rebalance_every: int = 5,
+        max_positions: int = 2,
+        max_exposure: float = 0.75,
+        initial_equity: float = 200.0,
+        fee_bps: float = 5.0,
+        slippage_bps: float = 2.0,
+        state_path: Path | None = None,
+    ) -> None:
+        self.policy = policy
+        self.symbols = tuple(symbols)
+        self.timeframe = timeframe
+        self.lookback = lookback
+        self.rebalance_every = rebalance_every
+        self.max_positions = max_positions
+        self.max_exposure = max_exposure
+        self.initial_equity = float(initial_equity)
+        self.fee_bps = fee_bps
+        self.slippage_bps = slippage_bps
+        self.state_path = state_path or state_path_for("PANEL", "momentum", timeframe)
+
+    def state(self) -> PaperState:
+        existing = load_state(self.state_path)
+        if existing is not None:
+            return existing
+        return PaperState(
+            version=STATE_VERSION,
+            inst_id="PANEL",
+            strategy="momentum",
+            timeframe=self.timeframe,
+            params={
+                "symbols": list(self.symbols),
+                "lookback": self.lookback,
+                "rebalance_every": self.rebalance_every,
+                "max_positions": self.max_positions,
+                "max_exposure": self.max_exposure,
+                "bars_since_rebalance": self.rebalance_every,
+            },
+            initial_equity=self.initial_equity,
+            equity=self.initial_equity,
+            peak_equity=self.initial_equity,
+            last_bar_ts=0,
+        )
+
+    def reset(self) -> Path:
+        if self.state_path.exists():
+            self.state_path.unlink()
+        return self.state_path
+
+    def step(
+        self,
+        frames: dict[str, pd.DataFrame],
+        *,
+        persist: bool = True,
+    ) -> StepReport:
+        from vito.backtest.panel import align_panel, rank_panel_at
+
+        if not frames:
+            raise PaperError("no frames")
+        ts, opens, _, lows, closes, stop_dists = align_panel(frames)
+        if len(ts) == 0:
+            raise PaperError("no aligned bars")
+
+        halted = kill_switch_active(self.policy)
+        state = self.state()
+
+        if state.last_bar_ts == 0:
+            ranked = rank_panel_at(
+                frames, lookback=self.lookback, max_positions=self.max_positions
+            )
+            state.last_bar_ts = int(ts[-1])
+            state.params["pending_targets"] = [
+                {"sym": s, "score": sc, "stop_dist": sd} for s, sc, _, sd in ranked
+            ]
+            if persist:
+                save_state(self.state_path, state)
+            return StepReport("warmed_up", 0, (), state.equity, state)
+
+        newer = (ts > state.last_bar_ts).nonzero()[0]
+        if len(newer) == 0:
+            return StepReport("no_new_bar", 0, (), state.equity, state)
+
+        cost_rate = (self.fee_bps + self.slippage_bps) / 10_000.0
+        fee_rate = self.fee_bps / 10_000.0
+        slip_rate = self.slippage_bps / 10_000.0
+        risk_frac = self.policy.risk.risk_per_trade_pct / 100.0
+
+        actions: list[str] = []
+        holdings: dict[str, dict[str, float]] = (
+            dict(state.position.get("holdings", {})) if state.position else {}
+        )
+        bars_since = int(state.params.get("bars_since_rebalance", self.rebalance_every))
+
+        for idx in newer:
+            i = int(idx)
+            # 1. Rebalance at bar i open if scheduled
+            pending = state.params.get("pending_targets")
+            if pending is not None and not halted:
+                if i > 0:
+                    for sym, h in list(holdings.items()):
+                        o_px = float(opens[sym][i])
+                        c_prev = float(closes[sym][i - 1])
+                        if o_px == o_px and c_prev == c_prev:
+                            state.equity += h["qty"] * (o_px - c_prev)
+
+                gross_each = (
+                    (state.equity * self.max_exposure) / max(1, len(pending))
+                    if pending
+                    else 0.0
+                )
+                desired: dict[str, tuple[float, float]] = {}
+                for item in pending:
+                    sym = str(item["sym"])
+                    sd = max(0.006, float(item.get("stop_dist", 0.02)))
+                    alloc = min(gross_each, (state.equity * risk_frac) / sd)
+                    desired[sym] = (alloc, sd)
+
+                new_holdings: dict[str, dict[str, float]] = {}
+                turnover = 0.0
+                for sym in set(holdings) | set(desired):
+                    o_px = float(opens[sym][i])
+                    old_not = (
+                        holdings[sym]["qty"] * o_px
+                        if sym in holdings and o_px == o_px
+                        else 0.0
+                    )
+                    new_not = desired[sym][0] if sym in desired and o_px > 0 else 0.0
+                    turnover += abs(new_not - old_not)
+                    if new_not > 0 and o_px > 0:
+                        sd = desired[sym][1]
+                        stop_px = o_px * (1.0 - sd)
+                        if sym in holdings:
+                            stop_px = max(float(holdings[sym]["stop"]), stop_px)
+                        new_holdings[sym] = {
+                            "qty": new_not / o_px,
+                            "entry_price": o_px,
+                            "notional": round(new_not, 2),
+                            "stop": round(stop_px, 4),
+                        }
+                fee = turnover * cost_rate
+                state.equity -= fee
+                state.fees_paid += fee
+                holdings = new_holdings
+                state.params["pending_targets"] = None
+                bars_since = 0
+                picked = "+".join(sorted(holdings)) if holdings else "cash"
+                actions.append(f"rebalance -> {picked} (turnover ${turnover:.2f}, fee ${fee:.2f})")
+
+            # 2. Intrabar stops and close-to-close mark
+            for sym in list(holdings):
+                h = holdings[sym]
+                lo_px = float(lows[sym][i])
+                o_px = float(opens[sym][i])
+                c_px = float(closes[sym][i])
+                c_prev = float(closes[sym][i - 1]) if i > 0 else o_px
+                ref = o_px if bars_since == 0 else c_prev
+                if lo_px == lo_px and lo_px <= float(h["stop"]):
+                    fill = min(o_px, float(h["stop"])) * (1.0 - slip_rate)
+                    pnl = h["qty"] * (fill - ref)
+                    fee = h["qty"] * fill * fee_rate
+                    state.equity += pnl - fee
+                    state.fees_paid += fee
+                    actions.append(f"stop {sym} @ {fill:.2f} (pnl {pnl:+.2f})")
+                    del holdings[sym]
+                elif c_px == c_px and ref == ref:
+                    state.equity += h["qty"] * (c_px - ref)
+                    sd = float(stop_dists[sym][i])
+                    if sd > 0 and sd == sd:
+                        h["stop"] = round(max(float(h["stop"]), c_px * (1.0 - sd)), 4)
+
+            bars_since += 1
+            if bars_since >= self.rebalance_every:
+                sliced = {
+                    s: df.loc[df["timestamp"] <= int(ts[i])].reset_index(drop=True)
+                    for s, df in frames.items()
+                }
+                ranked = rank_panel_at(
+                    sliced, lookback=self.lookback, max_positions=self.max_positions
+                )
+                state.params["pending_targets"] = [
+                    {"sym": s, "score": sc, "stop_dist": sd} for s, sc, _, sd in ranked
+                ]
+
+        state.params["bars_since_rebalance"] = bars_since
+        state.last_bar_ts = int(ts[-1])
+        state.peak_equity = max(state.peak_equity, state.equity)
+        if holdings:
+            total_not = sum(float(h["notional"]) for h in holdings.values())
+            state.position = {
+                "side": "+".join(sorted(holdings)),
+                "notional": round(total_not, 2),
+                "entry_price": 0.0,
+                "stop": 0.0,
+                "holdings": holdings,
+            }
+        else:
+            state.position = None
+
+        if persist:
+            save_state(self.state_path, state)
+
+        return StepReport("stepped", len(newer), tuple(actions), state.equity, state)

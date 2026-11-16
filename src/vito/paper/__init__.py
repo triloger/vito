@@ -3,6 +3,7 @@
 from vito.paper.broker import (
     PaperBroker,
     PaperError,
+    PaperPanelBroker,
     PaperState,
     StepReport,
     kill_switch_active,
@@ -14,6 +15,7 @@ from vito.paper.broker import (
 __all__ = [
     "PaperBroker",
     "PaperError",
+    "PaperPanelBroker",
     "PaperState",
     "StepReport",
     "kill_switch_active",

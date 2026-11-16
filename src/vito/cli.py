@@ -42,7 +42,7 @@ from vito.data.ohlcv import (
 )
 from vito.exchange.okx import ExchangeUnavailable, MissingCredentials, OkxGateway
 from vito.network import EgressStatus, check_egress, fetch_egress_ip
-from vito.paper import PaperBroker, load_state
+from vito.paper import PaperBroker, PaperPanelBroker, load_state
 from vito.policy import Policy, PolicyError, load_policy
 from vito.portfolio.snapshot import Snapshot, build_snapshot
 from vito.risk import kill_switch_engaged
@@ -795,6 +795,91 @@ def cmd_paper_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_paper_panel(args: argparse.Namespace) -> int:
+    policy = load_policy(args.policy)
+    gateway = OkxGateway(load_credentials())
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+
+    frames = {}
+    with console.status(f"fetching {len(symbols)} instruments ({args.timeframe})…", spinner="dots"):
+        for sym in symbols:
+            try:
+                raw = fetch_recent(gateway, sym, timeframe=args.timeframe, limit=args.bars)
+                closed = closed_only(raw, args.timeframe)
+                if not closed.empty:
+                    frames[sym] = closed
+            except ExchangeUnavailable:
+                continue
+
+    if not frames:
+        console.print("[red]no closed candles returned for panel[/red]")
+        return 2
+
+    broker = PaperPanelBroker(
+        policy=policy,
+        symbols=symbols,
+        timeframe=args.timeframe,
+        lookback=args.lookback,
+        rebalance_every=args.rebalance_every,
+        max_positions=args.max_positions,
+        max_exposure=args.max_exposure,
+        initial_equity=args.initial,
+        fee_bps=args.fee_bps,
+        state_path=Path(args.state).expanduser() if args.state else None,
+    )
+    if args.reset:
+        broker.reset()
+
+    report = broker.step(frames)
+    summary = report.state.summary()
+    pending = report.state.params.get("pending_targets") or []
+
+    if args.json:
+        console.print_json(
+            json.dumps(
+                {
+                    "status": report.status,
+                    "bars_processed": report.bars_processed,
+                    "actions": list(report.actions),
+                    "pending_targets": pending,
+                    "state_file": str(broker.state_path),
+                    **summary,
+                },
+                default=str,
+            )
+        )
+        return 0
+
+    console.print(_header(policy))
+    console.print(
+        f"[bold]PANEL ({len(frames)} assets)[/bold] {args.timeframe} · momentum · "
+        f"paper · start {_money(args.initial)} USDT"
+    )
+    if report.status == "warmed_up":
+        targets = (
+            ", ".join(f"{t['sym']} (score {t['score']:+.2f})" for t in pending)
+            if pending
+            else "cash (no uptrend)"
+        )
+        console.print(
+            f"[dim]warmed up on history — queued for next open: {targets}[/dim]"
+        )
+    elif report.status == "no_new_bar":
+        console.print("[dim]no new closed bar since the last step[/dim]")
+    else:
+        console.print(f"[dim]{report.bars_processed} new bar(s) processed[/dim]")
+
+    for action in report.actions:
+        console.print(f"  [green]{action}[/green]")
+
+    console.print(
+        f"equity [bold]{_money(summary['equity'])}[/bold] USDT · "
+        f"{summary['return_pct']:+.2f}% · fees {summary['fees_paid']:.2f}"
+    )
+    console.print(f"[dim]state: {broker.state_path}[/dim]")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # net
 # ---------------------------------------------------------------------------
@@ -1055,6 +1140,7 @@ def cmd_panel(args: argparse.Namespace) -> int:
         f"portfolio · return [bold]{m['total_return_pct']:+.2f}%[/bold] "
         f"(CAGR {m['cagr_pct']:+.2f}%) · max DD [red]{m['max_drawdown_pct']:.1f}%[/red] · "
         f"sharpe {m['sharpe']:.2f} (t={m['t_stat']:+.2f}) · "
+        f"stops {int(m.get('stops_hit', 0))} · "
         f"exposure {m['exposure_pct']:.1f}% · fees {m['fees_paid']:.2f} USDT"
     )
     console.print(
@@ -1205,6 +1291,23 @@ def build_parser() -> argparse.ArgumentParser:
     show.add_argument("--state", default=None, help="state file to inspect")
     show.add_argument("--json", action="store_true", help="machine-readable output")
     show.set_defaults(func=cmd_paper_status)
+
+    p_panel = paper_sub.add_parser(
+        "panel", help="step cross-asset momentum panel against live closed bars"
+    )
+    p_panel.add_argument("--symbols", default=",".join(DEFAULT_BASKET))
+    p_panel.add_argument("--timeframe", default="1d", choices=sorted(TIMEFRAME_MS))
+    p_panel.add_argument("--lookback", type=int, default=20)
+    p_panel.add_argument("--rebalance-every", type=int, default=5)
+    p_panel.add_argument("--max-positions", type=int, default=2)
+    p_panel.add_argument("--max-exposure", type=float, default=0.75)
+    p_panel.add_argument("--initial", type=float, default=200.0)
+    p_panel.add_argument("--fee-bps", type=float, default=5.0)
+    p_panel.add_argument("--bars", type=int, default=100)
+    p_panel.add_argument("--state", default=None)
+    p_panel.add_argument("--reset", action="store_true")
+    p_panel.add_argument("--json", action="store_true")
+    p_panel.set_defaults(func=cmd_paper_panel)
 
     return parser
 

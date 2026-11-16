@@ -7,7 +7,8 @@ observations to separate signal from noise, and 84 parameter combinations
 guaranteed selection bias.
 
 This module tests **one pre-registered, fixed-parameter hypothesis** across a
-multi-asset panel (Crypto + Equities/Indices + Commodities):
+macro index + monetary cross-asset panel (Crypto + US Equity Indices +
+Precious Metals):
 
 1. **Absolute trend filter (time-series momentum):** At each rebalance close
    ``t``, an instrument is eligible (long-only) only if its trailing
@@ -17,10 +18,14 @@ multi-asset panel (Crypto + Equities/Indices + Commodities):
 2. **Relative strength rank (cross-sectional momentum):** Eligible instruments
    are ranked by volatility-adjusted return (``return / volatility`` over
    ``lookback``). The top ``max_positions`` are selected.
-3. **Next-open execution & turnover-only costs:** Weights decided at close ``t``
+3. **Risk-based sizing & intrabar ATR stops:** Each selected position is sized
+   by ``(equity * risk_per_trade_pct) / stop_distance``, clamped by the
+   portfolio gross exposure cap (``max_gross_exposure_mult``). Between
+   rebalances, every held asset carries a trailing ATR stop checked against
+   each bar's ``low`` (filling at ``min(open, stop)`` on a gap-through).
+4. **Next-open execution & turnover-only costs:** Weights decided at close ``t``
    execute at open ``t + 1``. Taker fees and slippage are charged on the
-   notional delta traded (`abs(new_notional - old_notional)`), plus intrabar
-   stop-outs if an asset drops through its ATR stop between rebalances.
+   notional delta traded.
 """
 
 from __future__ import annotations
@@ -31,16 +36,16 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from vito.strategy.indicators import atr
+
 DEFAULT_BASKET: tuple[str, ...] = (
     "BTC-USDT-SWAP",
     "ETH-USDT-SWAP",
     "SOL-USDT-SWAP",
     "QQQ-USDT-SWAP",
     "SPY-USDT-SWAP",
-    "NVDA-USDT-SWAP",
     "XAU-USDT-SWAP",
     "XAG-USDT-SWAP",
-    "CL-USDT-SWAP",
 )
 
 BARS_PER_YEAR = {"1h": 24 * 365, "4h": 6 * 365, "1d": 365}
@@ -74,7 +79,18 @@ class PanelResult:
 
 def align_panel(
     frames: dict[str, pd.DataFrame],
-) -> tuple[np.ndarray, dict[str, np.ndarray], dict[str, np.ndarray]]:
+    *,
+    atr_window: int = 14,
+    atr_mult: float = 2.5,
+    min_stop_pct: float = 0.006,
+) -> tuple[
+    np.ndarray,
+    dict[str, np.ndarray],
+    dict[str, np.ndarray],
+    dict[str, np.ndarray],
+    dict[str, np.ndarray],
+    dict[str, np.ndarray],
+]:
     """Align multiple OHLCV frames on the union of timestamps (point-in-time).
 
     Instruments listed later have ``NaN`` prior to their listing date and only
@@ -93,14 +109,81 @@ def align_panel(
 
     ts = np.array(sorted(all_ts), dtype=np.int64)
     opens: dict[str, np.ndarray] = {}
+    highs: dict[str, np.ndarray] = {}
+    lows: dict[str, np.ndarray] = {}
     closes: dict[str, np.ndarray] = {}
+    stop_dists: dict[str, np.ndarray] = {}
 
     for sym, df in non_empty.items():
-        indexed = df.drop_duplicates("timestamp").set_index("timestamp").reindex(ts)
-        opens[sym] = indexed["open"].to_numpy(dtype=float)
-        closes[sym] = indexed["close"].to_numpy(dtype=float)
+        clean = df.drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
+        c_ser = clean["close"].astype(float)
+        if "high" in clean.columns and "low" in clean.columns:
+            atr_ser = atr(
+                clean["high"].astype(float),
+                clean["low"].astype(float),
+                c_ser,
+                atr_window,
+            )
+            raw_stop = (atr_ser * atr_mult / c_ser).clip(lower=min_stop_pct)
+        else:
+            raw_stop = pd.Series(0.02, index=clean.index)
+        clean = clean.assign(_stop_dist=raw_stop)
 
-    return ts, opens, closes
+        indexed = clean.set_index("timestamp").reindex(ts)
+        opens[sym] = indexed["open"].to_numpy(dtype=float)
+        highs[sym] = (
+            indexed["high"].to_numpy(dtype=float)
+            if "high" in indexed.columns
+            else opens[sym].copy()
+        )
+        lows[sym] = (
+            indexed["low"].to_numpy(dtype=float)
+            if "low" in indexed.columns
+            else opens[sym].copy()
+        )
+        closes[sym] = indexed["close"].to_numpy(dtype=float)
+        stop_dists[sym] = indexed["_stop_dist"].fillna(0.02).to_numpy(dtype=float)
+
+    return ts, opens, highs, lows, closes, stop_dists
+
+
+def rank_panel_at(
+    frames: dict[str, pd.DataFrame],
+    *,
+    lookback: int = 20,
+    max_positions: int = 2,
+    atr_mult: float = 2.5,
+) -> list[tuple[str, float, float, float]]:
+    """Rank instruments on the latest closed bar.
+
+    Returns ``[(inst_id, score, close, stop_distance), ...]`` for the top
+    ``max_positions`` instruments passing the absolute trend filter.
+    """
+    _, _, _, _, closes, stop_dists = align_panel(frames, atr_mult=atr_mult)
+    symbols = sorted(closes)
+    candidates: list[tuple[float, str, float, float]] = []
+    for sym in symbols:
+        s = pd.Series(closes[sym]).dropna()
+        if len(s) <= lookback:
+            continue
+        ret = float(s.pct_change(lookback).iloc[-1])
+        sma = float(s.rolling(lookback).mean().iloc[-1])
+        vol = float(s.pct_change().rolling(lookback).std().iloc[-1])
+        last_close = float(s.iloc[-1])
+        stop_d = float(stop_dists[sym][-1])
+        if (
+            math.isfinite(ret)
+            and math.isfinite(vol)
+            and ret > 0
+            and last_close > sma
+            and vol > 1e-8
+        ):
+            candidates.append((ret / vol, sym, last_close, stop_d))
+    candidates.sort(reverse=True)
+    return [
+        (sym, round(score, 4), last_close, round(stop_d, 4))
+        for score, sym, last_close, stop_d in candidates[:max_positions]
+    ]
 
 
 def run_panel_momentum(
@@ -111,23 +194,28 @@ def run_panel_momentum(
     rebalance_every: int = 5,
     max_positions: int = 2,
     max_gross_exposure_mult: float = 0.75,
+    risk_per_trade_pct: float = 1.5,
+    atr_mult: float = 2.5,
+    use_stops: bool = True,
     initial_equity: float = 200.0,
     fee_bps: float = 5.0,
     slippage_bps: float = 2.0,
     min_notional: dict[str, float] | None = None,
 ) -> PanelResult:
     """Run the pre-registered long-only cross-asset momentum portfolio."""
-    ts, opens, closes = align_panel(frames)
+    ts, opens, _, lows, closes, stop_dists = align_panel(frames, atr_mult=atr_mult)
     symbols = tuple(sorted(closes))
     n = len(ts)
     if n <= lookback + 2:
         raise ValueError(f"need > {lookback + 2} overlapping bars, have {n}")
 
     cost_rate = (fee_bps + slippage_bps) / 10_000.0
+    slip_rate = slippage_bps / 10_000.0
+    fee_rate = fee_bps / 10_000.0
+    risk_frac = risk_per_trade_pct / 100.0
     min_notional_map = min_notional or {}
 
-    # Pre-compute strictly backward-looking momentum score at bar i close:
-    # eligible iff close[i] > close[i - lookback] AND close[i] > mean(close[i-lookback+1 : i+1])
+    # Pre-compute strictly backward-looking momentum score at bar i close
     scores: dict[str, np.ndarray] = {}
     for sym in symbols:
         c = closes[sym]
@@ -144,39 +232,84 @@ def run_panel_momentum(
 
     equity = float(initial_equity)
     curve = np.full(n, initial_equity, dtype=float)
-    # Current holdings: sym -> quantity (in underlying units)
     holdings: dict[str, float] = {}
-    pending_targets: tuple[str, ...] | None = None
+    stops: dict[str, float] = {}
+    pending_targets: tuple[tuple[str, float], ...] | None = None
     rebalances: list[RebalanceRecord] = []
     total_fees = 0.0
     total_turnover = 0.0
+    stops_hit = 0
     bars_invested = 0
     asset_pnl: dict[str, float] = dict.fromkeys(symbols, 0.0)
     asset_bars: dict[str, int] = dict.fromkeys(symbols, 0)
 
+    def check_intrabar_stops(i: int, from_open: bool) -> None:
+        nonlocal equity, total_fees, total_turnover, stops_hit
+        if not use_stops or not holdings:
+            return
+        for sym in list(holdings):
+            qty = holdings[sym]
+            lo_px = lows[sym][i]
+            open_px = opens[sym][i]
+            ref_px = open_px if from_open else closes[sym][i - 1]
+            stop_px = stops.get(sym, 0.0)
+            if math.isfinite(lo_px) and stop_px > 0 and lo_px <= stop_px:
+                fill_px = min(open_px, stop_px) * (1.0 - slip_rate)
+                pnl = qty * (fill_px - ref_px)
+                notional_exit = qty * fill_px
+                fee = notional_exit * fee_rate
+                equity += pnl - fee
+                asset_pnl[sym] += pnl
+                total_fees += fee
+                total_turnover += notional_exit
+                stops_hit += 1
+                del holdings[sym]
+                stops.pop(sym, None)
+
     for i in range(n):
         # 1. Execute pending rebalance at bar i open
         if pending_targets is not None:
-            # Mark existing holdings to open[i]
+            # First mark existing holdings from close[i-1] to open[i]
             if i > 0:
-                for sym, qty in holdings.items():
-                    step_pnl = qty * (opens[sym][i] - closes[sym][i - 1])
-                    equity += step_pnl
-                    asset_pnl[sym] += step_pnl
+                for sym, qty in list(holdings.items()):
+                    open_px = opens[sym][i]
+                    prev_c = closes[sym][i - 1]
+                    if math.isfinite(open_px) and math.isfinite(prev_c):
+                        # If gapped below stop at open, exit at open
+                        if use_stops and open_px <= stops.get(sym, 0.0):
+                            fill_px = open_px * (1.0 - slip_rate)
+                            pnl = qty * (fill_px - prev_c)
+                            notional_exit = qty * fill_px
+                            fee = notional_exit * fee_rate
+                            equity += pnl - fee
+                            asset_pnl[sym] += pnl
+                            total_fees += fee
+                            total_turnover += notional_exit
+                            stops_hit += 1
+                            del holdings[sym]
+                            stops.pop(sym, None)
+                        else:
+                            step_pnl = qty * (open_px - prev_c)
+                            equity += step_pnl
+                            asset_pnl[sym] += step_pnl
 
-            target_syms = [
-                sym
-                for sym in pending_targets
-                if (equity * max_gross_exposure_mult / max(1, len(pending_targets)))
-                >= min_notional_map.get(sym, 0.0)
-            ]
-            target_notional_each = (
-                (equity * max_gross_exposure_mult) / len(target_syms)
-                if target_syms
+            gross_cap_each = (
+                (equity * max_gross_exposure_mult) / max(1, len(pending_targets))
+                if pending_targets
                 else 0.0
             )
+            desired_notional: dict[str, float] = {}
+            desired_stop_dist: dict[str, float] = {}
+            for sym, stop_d in pending_targets:
+                safe_stop = max(0.006, stop_d if math.isfinite(stop_d) and stop_d > 0 else 0.02)
+                risk_notional = (equity * risk_frac) / safe_stop if use_stops else gross_cap_each
+                alloc = min(gross_cap_each, risk_notional)
+                if alloc >= min_notional_map.get(sym, 0.0):
+                    desired_notional[sym] = alloc
+                    desired_stop_dist[sym] = safe_stop
 
             new_holdings: dict[str, float] = {}
+            new_stops: dict[str, float] = {}
             turnover = 0.0
             for sym in symbols:
                 open_px = opens[sym][i]
@@ -186,45 +319,66 @@ def run_panel_momentum(
                     else 0.0
                 )
                 new_notional = (
-                    target_notional_each
-                    if sym in target_syms and math.isfinite(open_px) and open_px > 0
+                    desired_notional.get(sym, 0.0)
+                    if sym in desired_notional and math.isfinite(open_px) and open_px > 0
                     else 0.0
                 )
                 turnover += abs(new_notional - old_notional)
                 if new_notional > 0 and open_px > 0:
                     new_holdings[sym] = new_notional / open_px
+                    stop_level = open_px * (1.0 - desired_stop_dist[sym])
+                    if sym in stops and sym in holdings:
+                        new_stops[sym] = max(stops[sym], stop_level)
+                    else:
+                        new_stops[sym] = stop_level
 
             fees = turnover * cost_rate
             equity -= fees
             total_fees += fees
             total_turnover += turnover
             holdings = new_holdings
+            stops = new_stops
+            avg_alloc = (
+                sum(desired_notional.values()) / len(desired_notional)
+                if desired_notional
+                else 0.0
+            )
             rebalances.append(
                 RebalanceRecord(
                     timestamp=int(ts[i]),
-                    selected=tuple(target_syms),
-                    notional_per_asset=round(target_notional_each, 2),
+                    selected=tuple(desired_notional),
+                    notional_per_asset=round(avg_alloc, 2),
                     turnover_usdt=round(turnover, 2),
                     fees_usdt=round(fees, 4),
                     equity_after=round(equity, 2),
                 )
             )
 
-            # Accrue open[i] -> close[i] on new holdings
+            # Check intrabar stops during bar i (from open[i])
+            check_intrabar_stops(i, from_open=True)
+
+            # Accrue open[i] -> close[i] on surviving holdings and ratchet trailing stop
             for sym, qty in holdings.items():
                 step_pnl = qty * (closes[sym][i] - opens[sym][i])
                 equity += step_pnl
                 asset_pnl[sym] += step_pnl
                 asset_bars[sym] += 1
+                sd = stop_dists[sym][i]
+                if math.isfinite(sd) and sd > 0:
+                    stops[sym] = max(stops.get(sym, 0.0), closes[sym][i] * (1.0 - sd))
             pending_targets = None
         else:
-            # Normal bar: accrue close[i-1] -> close[i]
+            # Normal bar: check intrabar stops first, then accrue close[i-1] -> close[i]
             if i > 0 and holdings:
+                check_intrabar_stops(i, from_open=False)
                 for sym, qty in holdings.items():
                     step_pnl = qty * (closes[sym][i] - closes[sym][i - 1])
                     equity += step_pnl
                     asset_pnl[sym] += step_pnl
                     asset_bars[sym] += 1
+                    sd = stop_dists[sym][i]
+                    if math.isfinite(sd) and sd > 0:
+                        stops[sym] = max(stops.get(sym, 0.0), closes[sym][i] * (1.0 - sd))
 
         if holdings:
             bars_invested += 1
@@ -234,19 +388,18 @@ def run_panel_momentum(
         if i >= lookback and (i - lookback) % rebalance_every == 0 and i + 1 < n:
             ranked = sorted(
                 (
-                    ( float(scores[sym][i]), sym )
+                    (float(scores[sym][i]), sym, float(stop_dists[sym][i]))
                     for sym in symbols
                     if math.isfinite(float(scores[sym][i])) and float(scores[sym][i]) > 0
                 ),
                 reverse=True,
             )
-            pending_targets = tuple(sym for _, sym in ranked[:max_positions])
+            pending_targets = tuple((sym, sd) for _, sym, sd in ranked[:max_positions])
 
     index = pd.to_datetime(ts, unit="ms")
     curve_series = pd.Series(curve, index=index, name="equity")
 
-    # Equal-weight benchmark over the active window (from lookback onwards),
-    # compounding daily equal-weighted returns across whichever instruments are listed on bar i.
+    # Equal-weight benchmark over the active window (from lookback onwards)
     ew_eq = np.full(n, initial_equity, dtype=float)
     for i in range(lookback + 1, n):
         bar_rets = [
@@ -269,6 +422,7 @@ def run_panel_momentum(
     metrics["fees_paid"] = round(total_fees, 2)
     metrics["turnover_usdt"] = round(total_turnover, 2)
     metrics["exposure_pct"] = round(bars_invested / max(1, n - lookback) * 100, 1)
+    metrics["stops_hit"] = float(stops_hit)
 
     benchmark = _panel_metrics(
         ew_curve.iloc[lookback:],
