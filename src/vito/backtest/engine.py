@@ -247,6 +247,8 @@ def run_backtest(
 
     if pos is not None and n:
         close_position(n - 1, c[n - 1], "end")
+        # the forced close paid fees and slippage; the last mark did not
+        curve[n - 1] = equity
 
     curve_series = pd.Series(curve, index=pd.to_datetime(ts, unit="ms"), name="equity")
     metrics = compute_metrics(curve_series, trades, initial_equity, timeframe)

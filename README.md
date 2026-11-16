@@ -98,6 +98,7 @@ vito policy     # the constitution and its digest
 vito net        # egress IP and allowlist drift
 vito doctor     # environment, connectivity, credentials
 vito backtest   # run a strategy over real OKX candles
+vito walkforward # choose parameters on the past, score them on the future
 ```
 
 or without installing: `python -m vito status`.
@@ -138,6 +139,32 @@ quality, decided the outcome. Treat every number above as in-sample and
 unproven; 44 trades is not a sample, it is an anecdote. See
 [`docs/journal/`](docs/journal/).
 
+### Walk-forward
+
+In-sample numbers cannot tell you whether a parameter choice generalises, because
+the parameters were chosen after seeing the data. `vito walkforward` trains on a
+rolling window, picks the best configuration there, and scores it on the next
+untouched window. Test windows are chained into one out-of-sample curve; a fold
+where nothing clears the minimum trade count and score sits out.
+
+```bash
+vito walkforward --symbol BTC-USDT-SWAP --timeframe 1d --train-bars 365 --test-bars 90
+```
+
+| Symbol | TF | Strategy | Folds | OOS return | Max DD | Sharpe | Trades | Buy & hold |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| BTC | 1d | breakout | 4 | +2.8% | −1.3% | 1.32 | 10 | −19.7% |
+| BTC | 1d | trend | 4 | −2.9% | −14.0% | −0.19 | 14 | −19.7% |
+| BTC | 4h | trend | 20 | −7.2% | −28.5% | −0.06 | 141 | −9.8% |
+| ETH | 1d | breakout | 4 | +0.0% | −2.2% | 0.03 | 15 | −32.2% |
+
+**The in-sample result did not survive.** The BTC 1d breakout fell from +8.5% to
++2.8% on 10 trades, and one fold carried the whole gain. The 4h trend, given
+twenty folds and 141 trades, is flat-to-negative after costs: there is now enough
+sample to call it dead. No configuration in this library has demonstrated
+out-of-sample edge, so the live gate stays shut and the next step is paper, not
+capital. That is the correct outcome to discover with paper money.
+
 ### Connecting an account (read-only first)
 
 Vito is read-only until you deliberately promote it. To see balances:
@@ -159,7 +186,7 @@ sub-account strategy and why the passphrase matters:
 | --- | --- | --- |
 | **0** ✅ | Repo, policy, docs, CI | — |
 | **1** ✅ | Read-only dashboard | `vito doctor` clean |
-| **2** ✅ | Backtester (fees, funding, slippage) | beats buy-and-hold *in sample* — not yet out of sample |
+| **2** ✅ | Backtester + walk-forward | ❌ failed: no out-of-sample edge, live stays off |
 | **2b** | Paper broker | ≥200 paper trades or 30 days positive |
 | **3** | Guarded live routing | 7 days shadow-diffed against live |
 | **4** | Daily report, journal, rebalance | — |
@@ -190,13 +217,13 @@ src/vito/
   portfolio/       account snapshot and valuation
   strategy/        indicators + trend / breakout / meanrev (pure functions)
   network.py       egress IP + allowlist drift detection
-  backtest/        event-driven engine: fees, funding, slippage, gap fills
+  backtest/        event-driven engine + walk-forward validation
   paper/           paper broker                   [phase 2b]
   exec/            order router + hash-chained audit log
-  cli.py           vito status | policy | net | doctor | backtest
+  cli.py           status | policy | net | doctor | backtest | walkforward
 docs/              architecture, risk policy, OKX setup, journal
 config/            policy.toml, config.example.toml
-tests/             96 tests, no network required
+tests/             107 tests, no network required
 ```
 
 ## License

@@ -44,8 +44,11 @@ caller to have checked the policy.
 | `exchange/okx.py` | OKX via ccxt; refuses private calls without keys | network |
 | `data/market.py` | Ticker + funding rows, degrades per-symbol | network (via gateway) |
 | `portfolio/snapshot.py` | Value holdings in USDT; flags unpriced assets | network (via gateway) |
-| `strategy/base.py` | `Signal` type and `Strategy` protocol | **none** (pure) |
-| `backtest/`, `paper/` | Phase 2 | not implemented |
+| `strategy/` | Indicator maths and signal generation | **none** (pure) |
+| `backtest/engine.py` | Event-driven replay: costs, funding, gap fills | **none** |
+| `backtest/walkforward.py` | Rolling train/test selection, chained OOS equity | **none** |
+| `data/ohlcv.py` | Paginated candles + funding, cached on disk | network, filesystem |
+| `paper/` | Paper broker | Phase 2b — not implemented |
 | `exec/` | `OrderRouter` (locked), `AuditLog` (hash-chained) | filesystem, later network |
 | `cli.py` | Presentation only | stdout |
 

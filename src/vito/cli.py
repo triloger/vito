@@ -5,6 +5,9 @@ Commands
 ``vito status``   market context + account snapshot (read-only)
 ``vito policy``   the risk constitution and its digest
 ``vito doctor``   environment, connectivity, and credential checks
+``vito net``      egress IP and allowlist drift
+``vito backtest`` a strategy over historical candles, with costs
+``vito walkforward`` parameters chosen on the past, scored on the future
 
 Nothing here can move funds. Execution is a separate, armed object.
 """
@@ -25,6 +28,7 @@ from rich.table import Table
 
 from vito import __version__
 from vito.backtest import buy_and_hold, run_backtest
+from vito.backtest.walkforward import fold_table, oos_buy_and_hold, walk_forward
 from vito.config import load_credentials, load_settings, repo_root
 from vito.data.market import MarketRow, market_rows
 from vito.data.ohlcv import TIMEFRAME_MS, fetch_candles, fetch_funding
@@ -517,6 +521,119 @@ def cmd_backtest(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# walk-forward
+# ---------------------------------------------------------------------------
+
+
+def cmd_walkforward(args: argparse.Namespace) -> int:
+    policy = load_policy(args.policy)
+    gateway = OkxGateway(load_credentials())
+
+    with console.status(f"fetching {args.symbol} {args.timeframe}…", spinner="dots"):
+        candles = fetch_candles(
+            gateway, args.symbol, timeframe=args.timeframe, days=args.days, refresh=args.refresh
+        )
+        funding = None
+        if args.symbol.endswith("-SWAP"):
+            funding = fetch_funding(gateway, args.symbol, days=args.days, refresh=args.refresh)
+
+    if candles.empty:
+        console.print("[red]no candles returned[/red]")
+        return 2
+
+    try:
+        result = walk_forward(
+            candles,
+            inst_id=args.symbol,
+            strategy_name=args.strategy,
+            policy=policy,
+            train_bars=args.train_bars,
+            test_bars=args.test_bars,
+            initial_equity=args.initial,
+            fee_bps=args.fee_bps,
+            funding=funding,
+            timeframe=args.timeframe,
+            objective=args.objective,
+            min_train_trades=args.min_train_trades,
+            min_train_score=args.min_train_score,
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return 2
+
+    benchmark = oos_buy_and_hold(candles, result, initial_equity=args.initial)
+
+    if args.json:
+        console.print_json(
+            json.dumps(
+                {
+                    "symbol": args.symbol,
+                    "timeframe": args.timeframe,
+                    "strategy": args.strategy,
+                    "objective": args.objective,
+                    "train_bars": args.train_bars,
+                    "test_bars": args.test_bars,
+                    "folds": fold_table(result),
+                    "out_of_sample": result.metrics,
+                    "buy_and_hold": benchmark,
+                    "selection_stability": result.selection,
+                },
+                default=str,
+            )
+        )
+        return 0
+
+    console.print(_header(policy))
+    console.print(
+        f"[bold]{args.symbol}[/bold] {args.timeframe} · {args.strategy} · "
+        f"train {args.train_bars} / test {args.test_bars} bars · "
+        f"objective {args.objective} · start {_money(args.initial)} USDT"
+    )
+
+    table = Table(title="Walk-forward", title_justify="left", header_style="bold")
+    for column in ("#", "Chosen on train", "Test", "Tr", "Score", "Trd"):
+        table.add_column(column, justify="left" if column == "Chosen on train" else "right")
+
+    for row in fold_table(result):
+        ret = float(row["test_return_pct"])
+        table.add_row(
+            str(row["fold"]),
+            row["params"],
+            f"[{'green' if ret > 0 else 'red'}]{ret:+.2f}%[/]",
+            str(row["test_trades"]),
+            f"{float(row['train_score']):+.2f}",
+            str(row["train_trades"]),
+        )
+    console.print(table)
+
+    m = result.metrics
+    console.print(
+        f"out of sample · {int(m['folds'])} folds ({int(m['folds_traded'])} traded) · "
+        f"{int(m['trades'])} trades · return [bold]{m['total_return_pct']:+.2f}%[/bold] · "
+        f"max DD [red]{m['max_drawdown_pct']:.1f}%[/red] · sharpe {m['sharpe']:.2f} · "
+        f"fees {m['fees_paid']:.2f} USDT"
+    )
+    console.print(
+        f"[dim]buy & hold over the same span · {benchmark['total_return_pct']:+.2f}% · "
+        f"DD {benchmark['max_drawdown_pct']:.1f}% · sharpe {benchmark['sharpe']:.2f}[/dim]"
+    )
+    if result.selection:
+        stability = " · ".join(f"{k} {v:.0%}" for k, v in result.selection.items())
+        console.print(
+            "[dim]parameter stability (share of folds picking the modal value): "
+            f"{stability}[/dim]"
+        )
+
+    positives = int(m["folds_positive"])
+    if positives * 2 <= int(m["folds"]):
+        console.print(
+            "[yellow]fewer than half the folds were profitable out of sample — "
+            "the in-sample result did not survive[/yellow]"
+        )
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # net
 # ---------------------------------------------------------------------------
 
@@ -615,6 +732,31 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument("--refresh", action="store_true", help="ignore cached candles")
     bt.add_argument("--json", action="store_true", help="machine-readable output")
     bt.set_defaults(func=cmd_backtest)
+
+    wf = sub.add_parser(
+        "walkforward", help="choose parameters on the past, score them on the future"
+    )
+    wf.add_argument("--symbol", default="BTC-USDT-SWAP")
+    wf.add_argument("--timeframe", default="1d", choices=sorted(TIMEFRAME_MS))
+    wf.add_argument("--days", type=int, default=730)
+    wf.add_argument("--strategy", default="breakout", choices=[*STRATEGIES])
+    wf.add_argument("--train-bars", type=int, default=365)
+    wf.add_argument("--test-bars", type=int, default=90)
+    wf.add_argument("--min-train-trades", type=int, default=4)
+    wf.add_argument(
+        "--min-train-score",
+        type=float,
+        default=0.0,
+        help="do not trade a fold unless the train window beats this score",
+    )
+    wf.add_argument(
+        "--objective", default="sharpe", choices=["sharpe", "expectancy", "return_dd"]
+    )
+    wf.add_argument("--initial", type=float, default=200.0, help="starting equity in USDT")
+    wf.add_argument("--fee-bps", type=float, default=5.0, help="taker fee per side")
+    wf.add_argument("--refresh", action="store_true", help="ignore cached candles")
+    wf.add_argument("--json", action="store_true", help="machine-readable output")
+    wf.set_defaults(func=cmd_walkforward)
 
     return parser
 
