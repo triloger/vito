@@ -19,6 +19,7 @@ from __future__ import annotations
 import math
 from collections import Counter
 from dataclasses import dataclass, field
+from statistics import NormalDist
 
 import numpy as np
 import pandas as pd
@@ -27,6 +28,15 @@ from vito.policy import Policy
 from vito.risk import SizeRequest, size_position
 
 BARS_PER_YEAR = {"1h": 24 * 365, "4h": 6 * 365, "1d": 365, "15m": 96 * 365, "5m": 288 * 365}
+BAR_MS = {
+    "1m": 60_000,
+    "5m": 300_000,
+    "15m": 900_000,
+    "1h": 3_600_000,
+    "4h": 14_400_000,
+    "1d": 86_400_000,
+}
+_NORM = NormalDist()
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +101,7 @@ def run_backtest(
     timeframe: str = "4h",
     max_bars: int = 90,
     allow_shorts: bool = True,
+    min_notional: float = 0.0,
 ) -> BacktestResult:
     if len(candles) != len(signals):
         raise ValueError("candles and signals must be aligned")
@@ -107,7 +118,7 @@ def run_backtest(
 
     fee_rate = fee_bps / 10_000.0
     slip = slippage_bps / 10_000.0
-    funding_by_bar = _align_funding(funding, ts)
+    funding_by_bar = _align_funding(funding, ts, BAR_MS.get(timeframe))
 
     n = len(candles)
     equity = float(initial_equity)
@@ -181,7 +192,7 @@ def run_backtest(
                 conviction=convict,
                 open_positions=0,
                 gross_exposure=0.0,
-                min_notional=0.0,
+                min_notional=min_notional,
             )
             result = size_position(request, policy)
             if result.ok:
@@ -273,15 +284,24 @@ def _opposite(a: str, b: str) -> bool:
     return (a, b) in (("long", "short"), ("short", "long"))
 
 
-def _align_funding(funding: pd.Series | None, ts: np.ndarray) -> np.ndarray:
+def _align_funding(
+    funding: pd.Series | None, ts: np.ndarray, bar_ms: int | None = None
+) -> np.ndarray:
+    """Assign each funding settlement to the candle ``[ts[i], ts[i+1])`` it falls in.
+
+    Settlements strictly before ``ts[0]`` or at/after the end of the final bar
+    are ignored rather than clamped onto the first or last bar.
+    """
     out = np.zeros(len(ts), dtype=float)
-    if funding is None or len(funding) == 0:
+    if funding is None or len(funding) == 0 or len(ts) == 0:
         return out
+    step = bar_ms or (int(ts[1] - ts[0]) if len(ts) > 1 else 86_400_000)
+    end_ts = int(ts[-1]) + step
     fts = np.asarray(funding.index, dtype=np.int64)
     rates = np.asarray(funding.to_numpy(), dtype=float)
-    idx = np.searchsorted(ts, fts, side="left")
+    idx = np.searchsorted(ts, fts, side="right") - 1
     for k, i in enumerate(idx):
-        if 0 <= i < len(ts):
+        if 0 <= i < len(ts) and ts[0] <= fts[k] < end_ts:
             out[i] += rates[k]
     return out
 
@@ -289,6 +309,34 @@ def _align_funding(funding: pd.Series | None, ts: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # metrics
 # ---------------------------------------------------------------------------
+
+
+def deflated_sharpe(
+    sharpe: float, n_bars: int, n_trials: int, per_year: int = 365
+) -> float:
+    """Probability that ``sharpe`` exceeds the expected null max across ``n_trials``.
+
+    Uses the Bailey & López de Prado (2014) expected maximum Sharpe approximation
+    under independent Gaussian trials of length ``years = n_bars / per_year``.
+    """
+    if n_bars <= 2 or per_year <= 0:
+        return 0.0
+    years = n_bars / per_year
+    if years <= 0:
+        return 0.0
+    se_sr = math.sqrt((1.0 + 0.5 * (sharpe**2) / per_year) / years)
+    if se_sr <= 0:
+        return 0.0
+    if n_trials <= 1:
+        sr0 = 0.0
+    else:
+        gamma = 0.5772156649015329
+        z1 = _NORM.inv_cdf(1.0 - 1.0 / n_trials)
+        z2 = _NORM.inv_cdf(1.0 - 1.0 / (n_trials * math.e))
+        z_max = (1.0 - gamma) * z1 + gamma * z2
+        sr0 = z_max / math.sqrt(years)
+    z = (sharpe - sr0) / se_sr
+    return round(float(_NORM.cdf(z)), 4)
 
 
 def buy_and_hold(
@@ -304,7 +352,12 @@ def buy_and_hold(
 
 
 def compute_metrics(
-    curve: pd.Series, trades: list[Trade], initial: float, timeframe: str
+    curve: pd.Series,
+    trades: list[Trade],
+    initial: float,
+    timeframe: str,
+    *,
+    n_trials: int = 1,
 ) -> dict[str, float]:
     if len(curve) == 0:
         return {}
@@ -326,13 +379,23 @@ def compute_metrics(
     losses = [t for t in trades if t.net <= 0]
     gross_profit = sum(t.net for t in wins)
     gross_loss = -sum(t.net for t in losses)
-    avg_r = sum(t.r_multiple for t in trades) / len(trades) if trades else 0.0
+    r_mults = [t.r_multiple for t in trades]
+    avg_r = sum(r_mults) / len(r_mults) if r_mults else 0.0
+    if len(r_mults) >= 2:
+        r_std = float(np.std(r_mults, ddof=1))
+        t_stat = avg_r / (r_std / math.sqrt(len(r_mults))) if r_std > 0 else 0.0
+    else:
+        t_stat = 0.0
+
+    dsr = deflated_sharpe(sharpe, len(curve), max(1, n_trials), per_year)
 
     return {
         "total_return_pct": round(total_return * 100, 2),
         "cagr_pct": round(cagr * 100, 2),
         "max_drawdown_pct": round(float(drawdown) * 100, 2),
         "sharpe": round(sharpe, 2),
+        "deflated_sharpe": dsr,
+        "t_stat": round(t_stat, 2),
         "trades": float(len(trades)),
         "win_rate_pct": round(len(wins) / len(trades) * 100, 1) if trades else 0.0,
         "profit_factor": round(gross_profit / gross_loss, 2) if gross_loss > 0 else float("inf"),

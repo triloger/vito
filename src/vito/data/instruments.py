@@ -1,0 +1,255 @@
+"""Instrument catalog and tradeability gate.
+
+Before testing a strategy on an instrument, two physical constraints must hold:
+
+1. **Order size fits the account.** On a $200 account with a 1.5% risk budget
+   and a 2% stop, target notional is $150 (0.75x equity). If the exchange's
+   minimum order (`contractSize * minSz * price`) exceeds the position cap, or
+   forces effective exposure above the ceiling, the instrument is untradeable
+   at this account size.
+2. **The book is liquid enough that backtest fills are not fiction.** Thin
+   books with wide spreads turn historical close-to-open backtests into wishful
+   thinking. A hard liquidity gate (`volume_24h_usdt >= 100_000` and
+   `spread_bps <= 10.0`) filters out dead pairs before research begins.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+import ccxt
+
+from vito.exchange.okx import ExchangeUnavailable, OkxGateway
+
+INST_CATEGORY_MAP = {
+    "1": "crypto",
+    "3": "equity",
+    "4": "commodity",
+}
+
+COMMODITY_BASES = {
+    "XAU",
+    "XAUT",
+    "PAXG",
+    "XAG",
+    "XPT",
+    "XPD",
+    "XCU",
+    "CL",
+    "BZ",
+    "NG",
+    "H100",
+    "USO",
+    "XUSO",
+    "URNM",
+    "XURNM",
+}
+
+CRYPTO_X_BASES = {
+    "XRP",
+    "XLM",
+    "XTZ",
+    "XCH",
+    "XPL",
+    "XDP",
+    "XEC",
+    "XMR",
+    "XEM",
+    "XDC",
+    "XAI",
+    "XION",
+    "XCN",
+    "XVS",
+    "XVG",
+    "XNO",
+    "XPRT",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class InstrumentSpec:
+    inst_id: str
+    symbol: str
+    kind: str  # "swap" | "spot"
+    asset_class: str  # "crypto" | "equity" | "commodity"
+    active: bool
+    last: float
+    spread_bps: float
+    volume_24h_usdt: float
+    contract_size: float
+    min_size: float
+    tick_size: float
+    min_notional_usdt: float
+    maker_bps: float
+    taker_bps: float
+    max_leverage: float
+    list_time_ms: int
+    tradeable: bool
+    reject_reason: str = ""
+
+
+def classify_asset(market: dict[str, Any]) -> str:
+    """Classify an OKX market into ``crypto``, ``equity``, or ``commodity``."""
+    info = market.get("info") or {}
+    cat = str(info.get("instCategory") or "")
+    if cat in INST_CATEGORY_MAP:
+        return INST_CATEGORY_MAP[cat]
+
+    base = str(market.get("base") or "").upper()
+    if base in COMMODITY_BASES:
+        return "commodity"
+    if base.startswith("X") and base not in CRYPTO_X_BASES and len(base) > 1:
+        return "equity"
+    return "crypto"
+
+
+def evaluate_market(
+    market: dict[str, Any],
+    ticker: dict[str, Any] | None,
+    *,
+    max_order_usdt: float = 150.0,
+    min_volume_usdt: float = 100_000.0,
+    max_spread_bps: float = 10.0,
+) -> InstrumentSpec | None:
+    """Build an :class:`InstrumentSpec` from a ccxt market and ticker dict."""
+    kind = str(market.get("type") or "")
+    if kind not in ("swap", "spot"):
+        return None
+    if kind == "swap" and not market.get("linear"):
+        return None
+    if str(market.get("quote") or "") != "USDT":
+        return None
+
+    inst_id = str(market.get("id") or "")
+    symbol = str(market.get("symbol") or "")
+    active = bool(market.get("active", True))
+    info = market.get("info") or {}
+
+    t = ticker or {}
+    t_info = t.get("info") or {}
+    last = float(t.get("last") or t.get("close") or 0.0)
+    bid = float(t.get("bid") or 0.0)
+    ask = float(t.get("ask") or 0.0)
+    mid = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else last
+
+    spread_bps = (
+        (ask - bid) / mid * 10_000.0 if (bid > 0 and ask > 0 and mid > 0) else float("inf")
+    )
+
+    # OKX ticker volume semantics:
+    # - For USDT spot, info.volCcy24h is quote volume in USDT.
+    # - For linear USDT swaps, info.volCcy24h is base volume (in underlying coins/shares).
+    vol_ccy = float(t_info.get("volCcy24h") or 0.0)
+    if vol_ccy > 0:
+        volume_24h_usdt = vol_ccy * last if kind == "swap" else vol_ccy
+    else:
+        qvol = float(t.get("quoteVolume") or 0.0)
+        bvol = float(t.get("baseVolume") or 0.0)
+        contract_val = float(market.get("contractSize") or 1.0)
+        volume_24h_usdt = qvol if qvol > 0 else bvol * contract_val * last
+
+    contract_size = float(market.get("contractSize") or 1.0)
+    limits_amt = (market.get("limits") or {}).get("amount") or {}
+    min_size = float(limits_amt.get("min") or info.get("minSz") or 0.0)
+    prec = market.get("precision") or {}
+    tick_size = float(prec.get("price") or info.get("tickSz") or 0.0)
+
+    ref_price = mid if mid > 0 else last
+    min_notional_usdt = contract_size * min_size * ref_price
+
+    maker_bps = float(market.get("maker") or 0.0) * 10_000.0
+    taker_bps = float(market.get("taker") or 0.0) * 10_000.0
+    try:
+        max_leverage = float(info.get("lever") or (1.0 if kind == "spot" else 0.0))
+    except (TypeError, ValueError):
+        max_leverage = 1.0 if kind == "spot" else 0.0
+
+    try:
+        list_time_ms = int(info.get("listTime") or 0)
+    except (TypeError, ValueError):
+        list_time_ms = 0
+
+    reasons: list[str] = []
+    if not active:
+        reasons.append("inactive")
+    if ref_price <= 0:
+        reasons.append("unpriced")
+    if min_notional_usdt <= 0 or min_notional_usdt > max_order_usdt:
+        reasons.append(f"min_notional>{max_order_usdt:.0f}")
+    if volume_24h_usdt < min_volume_usdt:
+        reasons.append("illiquid")
+    if spread_bps > max_spread_bps:
+        reasons.append("wide_spread")
+
+    return InstrumentSpec(
+        inst_id=inst_id,
+        symbol=symbol,
+        kind=kind,
+        asset_class=classify_asset(market),
+        active=active,
+        last=round(last, 6),
+        spread_bps=round(spread_bps, 2) if spread_bps != float("inf") else 9999.0,
+        volume_24h_usdt=round(volume_24h_usdt, 2),
+        contract_size=contract_size,
+        min_size=min_size,
+        tick_size=tick_size,
+        min_notional_usdt=round(min_notional_usdt, 2),
+        maker_bps=round(maker_bps, 2),
+        taker_bps=round(taker_bps, 2),
+        max_leverage=max_leverage,
+        list_time_ms=list_time_ms,
+        tradeable=len(reasons) == 0,
+        reject_reason=",".join(reasons),
+    )
+
+
+def scan_instruments(
+    gateway: OkxGateway,
+    *,
+    kind: str = "all",
+    asset_class: str = "all",
+    equity: float = 200.0,
+    max_exposure_mult: float = 0.75,
+    min_volume_usdt: float = 100_000.0,
+    max_spread_bps: float = 10.0,
+    only_tradeable: bool = True,
+) -> list[InstrumentSpec]:
+    """Scan OKX USDT spot and linear swap markets and apply the liquidity/sizing gate."""
+    markets = gateway.markets()
+    max_order_usdt = equity * max_exposure_mult
+
+    swap_tickers: dict[str, dict[str, Any]] = {}
+    spot_tickers: dict[str, dict[str, Any]] = {}
+    try:
+        if kind in ("all", "swap"):
+            swap_tickers = gateway.client.fetch_tickers(params={"instType": "SWAP"})
+        if kind in ("all", "spot"):
+            spot_tickers = gateway.client.fetch_tickers(params={"instType": "SPOT"})
+    except ccxt.BaseError as exc:  # pragma: no cover - network
+        raise ExchangeUnavailable(str(exc)) from exc
+
+    specs: list[InstrumentSpec] = []
+    for market in markets.values():
+        m_type = str(market.get("type") or "")
+        if kind != "all" and m_type != kind:
+            continue
+        sym = str(market.get("symbol") or "")
+        ticker = swap_tickers.get(sym) if m_type == "swap" else spot_tickers.get(sym)
+        spec = evaluate_market(
+            market,
+            ticker,
+            max_order_usdt=max_order_usdt,
+            min_volume_usdt=min_volume_usdt,
+            max_spread_bps=max_spread_bps,
+        )
+        if spec is None:
+            continue
+        if asset_class != "all" and spec.asset_class != asset_class:
+            continue
+        if only_tradeable and not spec.tradeable:
+            continue
+        specs.append(spec)
+
+    specs.sort(key=lambda s: (-s.volume_24h_usdt, s.inst_id))
+    return specs

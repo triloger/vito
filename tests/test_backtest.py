@@ -144,6 +144,38 @@ def test_funding_is_charged_to_longs(policy) -> None:
     assert result.trades[0].funding > 0
 
 
+def test_align_funding_assigns_intrabar_and_drops_pre_window() -> None:
+    import numpy as np
+
+    from vito.backtest.engine import _align_funding
+
+    day = 86_400_000
+    t0 = 1_700_000_000_000
+    ts = np.array([t0, t0 + day, t0 + 2 * day], dtype=np.int64)
+    funding = pd.Series(
+        [0.01, 0.0001, 0.0002, 0.0003, 0.0004, 0.09],
+        index=[
+            t0 - 1000,  # before window -> dropped
+            t0,  # day 0 00:00 -> bar 0
+            t0 + 8 * 3_600_000,  # day 0 08:00 -> bar 0
+            t0 + 16 * 3_600_000,  # day 0 16:00 -> bar 0
+            t0 + day + 8 * 3_600_000,  # day 1 08:00 -> bar 1
+            t0 + 3 * day,  # after window -> dropped
+        ],
+    )
+    aligned = _align_funding(funding, ts, day)
+    assert aligned[0] == pytest.approx(0.0006)
+    assert aligned[1] == pytest.approx(0.0004)
+    assert aligned[2] == pytest.approx(0.0)
+
+
+def test_min_notional_refuses_undersized_orders(policy) -> None:
+    frame = candles([100] * 4, [101] * 4, [99.5] * 4, [100] * 4)
+    result = run(frame, signals(["long", "flat", "flat", "flat"]), policy, min_notional=5_000.0)
+    assert result.n_trades == 0
+    assert result.skipped.get("below_min_notional", 0) >= 1
+
+
 # ---------------------------------------------------------------------------
 # accounting
 # ---------------------------------------------------------------------------

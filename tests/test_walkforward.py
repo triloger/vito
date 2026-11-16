@@ -126,7 +126,7 @@ def test_test_windows_are_disjoint_and_contiguous(long_only) -> None:
         assert next_start == prev_end
 
 
-def test_oos_curve_only_covers_traded_folds(long_only) -> None:
+def test_oos_curve_covers_full_oos_span_even_when_sitting_out(long_only) -> None:
     result = walk_forward(
         candles(500),
         inst_id="BTC-USDT-SWAP",
@@ -135,9 +135,13 @@ def test_oos_curve_only_covers_traded_folds(long_only) -> None:
         grid={"window": [10, 20]},
         train_bars=200,
         test_bars=100,
+        min_train_trades=10_000,
     )
-    traded_bars = sum(f.test_end - f.test_start for f in result.folds if f.traded)
-    assert len(result.equity_curve) == traded_bars
+    total_oos_bars = sum(f.test_end - f.test_start for f in result.folds)
+    assert len(result.equity_curve) == total_oos_bars
+    assert (result.equity_curve == 200.0).all()
+    assert "deflated_sharpe" in result.metrics
+    assert "t_stat" in result.metrics
 
 
 def test_sitting_out_leaves_equity_untouched(long_only) -> None:

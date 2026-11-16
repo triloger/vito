@@ -85,30 +85,42 @@ def fetch_candles(
     days: int = 730,
     refresh: bool = False,
 ) -> pd.DataFrame:
-    """OHLCV for ``days`` back, paginated and cached."""
+    """OHLCV for ``days`` back, paginated backwards from present and cached.
+
+    Paging backwards via ``after`` (oldest timestamp seen) ensures instruments
+    listed more recently than ``days`` ago still return their full history
+    rather than an empty initial page at ``since``.
+    """
     path = _cache_path("ohlcv", inst_id, timeframe, days)
     if path.exists() and not refresh:
         return pd.read_csv(path)
 
     market = gateway._market(inst_id)  # noqa: SLF001 - same package
-    step = TIMEFRAME_MS[timeframe]
     now = int(time.time() * 1000)
     since = now - days * 86_400_000
 
     rows: list[list[float]] = []
-    cursor = since
-    while cursor < now:
+    after_cursor: int | None = None
+    max_pages = max(20, int(days * 86_400_000 / TIMEFRAME_MS[timeframe] / 90) + 5)
+
+    for _ in range(max_pages):
+        params = {"after": str(after_cursor)} if after_cursor is not None else {}
         batch = gateway.client.fetch_ohlcv(
-            market["symbol"], timeframe=timeframe, since=cursor, limit=100
+            market["symbol"], timeframe=timeframe, limit=100, params=params
         )
         if not batch:
             break
         rows.extend(batch)
-        cursor = batch[-1][0] + step
-        if len(batch) < 100:
+        oldest = int(batch[0][0])
+        if oldest <= since or len(batch) < 100:
             break
+        if after_cursor is not None and oldest >= after_cursor:
+            break
+        after_cursor = oldest
 
     frame = _frame(rows)
+    if not frame.empty:
+        frame = frame.loc[frame["timestamp"] >= since].reset_index(drop=True)
     frame.to_csv(path, index=False)
     return frame
 
@@ -129,11 +141,14 @@ def fetch_funding(
     market = gateway._market(inst_id)  # noqa: SLF001
     since = int(time.time() * 1000) - days * 86_400_000
     rows: list[tuple[int, float]] = []
-    cursor = since
-    while True:
+    after_cursor: int | None = None
+    max_pages = max(15, int(days * 3 / 90) + 5)
+
+    for _ in range(max_pages):
+        params = {"after": str(after_cursor)} if after_cursor is not None else {}
         try:
             batch = gateway.client.fetch_funding_rate_history(
-                market["symbol"], since=cursor, limit=100
+                market["symbol"], limit=100, params=params
             )
         except Exception:  # noqa: BLE001 - funding is best-effort
             break
@@ -141,14 +156,17 @@ def fetch_funding(
             break
         for item in batch:
             rows.append((int(item["timestamp"]), float(item["fundingRate"])))
-        cursor = batch[-1]["timestamp"] + 1
-        if len(batch) < 100:
+        oldest = int(batch[0]["timestamp"])
+        if oldest <= since or len(batch) < 100:
             break
+        if after_cursor is not None and oldest >= after_cursor:
+            break
+        after_cursor = oldest
 
     if not rows:
         return pd.Series(dtype=float)
 
     frame = pd.DataFrame(rows, columns=["timestamp", "rate"]).drop_duplicates("timestamp")
-    frame = frame.sort_values("timestamp")
+    frame = frame.loc[frame["timestamp"] >= since].sort_values("timestamp").reset_index(drop=True)
     frame.to_csv(path, index=False)
     return pd.Series(frame["rate"].to_numpy(), index=frame["timestamp"].to_numpy())

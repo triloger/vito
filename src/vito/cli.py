@@ -30,6 +30,7 @@ from vito import __version__
 from vito.backtest import buy_and_hold, run_backtest
 from vito.backtest.walkforward import fold_table, oos_buy_and_hold, walk_forward
 from vito.config import load_credentials, load_settings, repo_root
+from vito.data.instruments import scan_instruments
 from vito.data.market import MarketRow, market_rows
 from vito.data.ohlcv import (
     TIMEFRAME_MS,
@@ -424,6 +425,10 @@ def cmd_backtest(args: argparse.Namespace) -> int:
             funding = fetch_funding(
                 gateway, args.symbol, days=args.days, refresh=args.refresh
             )
+        try:
+            min_notional = gateway.min_notional(args.symbol)
+        except ExchangeUnavailable:
+            min_notional = 0.0
 
     if candles.empty:
         console.print("[red]no candles returned[/red]")
@@ -447,6 +452,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
             fee_bps=args.fee_bps,
             funding=funding,
             timeframe=args.timeframe,
+            min_notional=min_notional,
         )
         results[name] = {**result.metrics, "skipped": result.skipped}
 
@@ -543,6 +549,10 @@ def cmd_walkforward(args: argparse.Namespace) -> int:
         funding = None
         if args.symbol.endswith("-SWAP"):
             funding = fetch_funding(gateway, args.symbol, days=args.days, refresh=args.refresh)
+        try:
+            min_notional = gateway.min_notional(args.symbol)
+        except ExchangeUnavailable:
+            min_notional = 0.0
 
     if candles.empty:
         console.print("[red]no candles returned[/red]")
@@ -563,6 +573,7 @@ def cmd_walkforward(args: argparse.Namespace) -> int:
             objective=args.objective,
             min_train_trades=args.min_train_trades,
             min_train_score=args.min_train_score,
+            min_notional=min_notional,
         )
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
@@ -617,7 +628,8 @@ def cmd_walkforward(args: argparse.Namespace) -> int:
     console.print(
         f"out of sample · {int(m['folds'])} folds ({int(m['folds_traded'])} traded) · "
         f"{int(m['trades'])} trades · return [bold]{m['total_return_pct']:+.2f}%[/bold] · "
-        f"max DD [red]{m['max_drawdown_pct']:.1f}%[/red] · sharpe {m['sharpe']:.2f} · "
+        f"max DD [red]{m['max_drawdown_pct']:.1f}%[/red] · sharpe {m['sharpe']:.2f} "
+        f"(DSR {m.get('deflated_sharpe', 0.0):.2f}, t={m.get('t_stat', 0.0):+.2f}) · "
         f"fees {m['fees_paid']:.2f} USDT"
     )
     console.print(
@@ -839,6 +851,108 @@ def cmd_net(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# instruments
+# ---------------------------------------------------------------------------
+
+
+def cmd_instruments(args: argparse.Namespace) -> int:
+    policy = load_policy(args.policy)
+    gateway = OkxGateway(load_credentials())
+
+    with console.status("scanning OKX instruments…", spinner="dots"):
+        specs = scan_instruments(
+            gateway,
+            kind=args.kind,
+            asset_class=args.asset_class,
+            equity=args.equity,
+            max_exposure_mult=args.max_exposure,
+            min_volume_usdt=args.min_vol,
+            max_spread_bps=args.max_spread_bps,
+            only_tradeable=not args.all,
+        )
+
+    shown = specs[: args.limit] if args.limit > 0 else specs
+
+    if args.json:
+        console.print_json(
+            json.dumps(
+                {
+                    "total_matching": len(specs),
+                    "tradeable_count": sum(1 for s in specs if s.tradeable),
+                    "gate": {
+                        "equity_usdt": args.equity,
+                        "max_exposure_mult": args.max_exposure,
+                        "max_order_usdt": round(args.equity * args.max_exposure, 2),
+                        "min_volume_usdt": args.min_vol,
+                        "max_spread_bps": args.max_spread_bps,
+                    },
+                    "instruments": [asdict(s) for s in shown],
+                },
+                default=str,
+            )
+        )
+        return 0
+
+    console.print(_header(policy))
+    max_order = args.equity * args.max_exposure
+    console.print(
+        f"gate · equity {_money(args.equity)} USDT · max order {_money(max_order)} USDT "
+        f"({args.max_exposure:.2f}x) · min 24h vol ${_money(args.min_vol, 0)} · "
+        f"max spread {args.max_spread_bps:.1f} bps"
+    )
+
+    table = Table(
+        title=f"Instruments ({len(shown)} of {len(specs)})",
+        title_justify="left",
+        header_style="bold",
+    )
+    for col in (
+        "Instrument",
+        "Class",
+        "Kind",
+        "Last",
+        "Spread",
+        "24h Vol $",
+        "ctVal",
+        "minSz",
+        "Min Order $",
+        "Taker",
+        "Gate",
+    ):
+        table.add_column(
+            col,
+            justify="left" if col in ("Instrument", "Class", "Kind", "Gate") else "right",
+            no_wrap=True,
+        )
+
+    for s in shown:
+        decimals = 2 if s.last >= 10 else 4
+        gate_str = (
+            "[green]pass[/green]"
+            if s.tradeable
+            else f"[red]{s.reject_reason or 'reject'}[/red]"
+        )
+        table.add_row(
+            s.inst_id,
+            s.asset_class,
+            s.kind,
+            _money(s.last, decimals),
+            f"{s.spread_bps:.1f}bp",
+            _money(s.volume_24h_usdt, 0),
+            f"{s.contract_size:g}",
+            f"{s.min_size:g}",
+            f"${_money(s.min_notional_usdt)}",
+            f"{s.taker_bps:.1f}bp",
+            gate_str,
+        )
+    if not shown:
+        table.add_row("none", "—", "—", "—", "—", "—", "—", "—", "—", "—", "—")
+
+    console.print(table)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # entry point
 # ---------------------------------------------------------------------------
 
@@ -871,6 +985,36 @@ def build_parser() -> argparse.ArgumentParser:
     net.add_argument("--json", action="store_true", help="machine-readable output")
     net.set_defaults(func=cmd_net)
 
+    inst = sub.add_parser(
+        "instruments",
+        help="scan OKX markets for contract specs, liquidity, and $200 tradeability",
+    )
+    inst.add_argument("--kind", default="all", choices=["all", "swap", "spot"])
+    inst.add_argument(
+        "--asset-class", default="all", choices=["all", "crypto", "equity", "commodity"]
+    )
+    inst.add_argument("--equity", type=float, default=200.0, help="account equity in USDT")
+    inst.add_argument(
+        "--max-exposure",
+        type=float,
+        default=0.75,
+        help="max notional per order as multiple of equity",
+    )
+    inst.add_argument(
+        "--min-vol", type=float, default=100_000.0, help="min 24h volume in USDT"
+    )
+    inst.add_argument(
+        "--max-spread-bps", type=float, default=10.0, help="max bid-ask spread in bps"
+    )
+    inst.add_argument(
+        "--all",
+        action="store_true",
+        help="include instruments rejected by the liquidity/sizing gate",
+    )
+    inst.add_argument("--limit", type=int, default=50, help="max rows to display (0 = all)")
+    inst.add_argument("--json", action="store_true", help="machine-readable output")
+    inst.set_defaults(func=cmd_instruments)
+
     bt = sub.add_parser("backtest", help="run a strategy over historical candles")
     bt.add_argument("--symbol", default="BTC-USDT-SWAP")
     bt.add_argument("--timeframe", default="4h", choices=sorted(TIMEFRAME_MS))
@@ -891,7 +1035,7 @@ def build_parser() -> argparse.ArgumentParser:
     wf.add_argument("--strategy", default="breakout", choices=[*STRATEGIES])
     wf.add_argument("--train-bars", type=int, default=365)
     wf.add_argument("--test-bars", type=int, default=90)
-    wf.add_argument("--min-train-trades", type=int, default=4)
+    wf.add_argument("--min-train-trades", type=int, default=15)
     wf.add_argument(
         "--min-train-score",
         type=float,

@@ -155,6 +155,7 @@ def walk_forward(
     min_train_trades: int = 4,
     min_train_score: float = 0.0,
     max_bars: int = 90,
+    min_notional: float = 0.0,
 ) -> WalkForwardResult:
     """Roll a parameter search forward through ``candles`` and score it blind."""
     grid = grid or DEFAULT_GRIDS.get(strategy_name)
@@ -213,6 +214,7 @@ def walk_forward(
                 funding=funding,
                 timeframe=timeframe,
                 max_bars=max_bars,
+                min_notional=min_notional,
             )
             if result.n_trades < min_train_trades:
                 continue
@@ -223,9 +225,12 @@ def walk_forward(
                 best = (score, params, result.n_trades)
 
         fold_index = len(folds)
+        test_candles = candles.iloc[test_start:test_end].reset_index(drop=True)
 
         if best is None:
             # Nothing traded enough to be worth trusting: sit out.
+            # Equity remains flat across the sat-out fold's calendar bars so
+            # OOS CAGR and Sharpe are not inflated by shrinking the time span.
             folds.append(
                 Fold(
                     index=fold_index,
@@ -241,13 +246,19 @@ def walk_forward(
                 )
             )
             scores.append(0.0)
+            prev_end = float(pieces[-1].iloc[-1]) if pieces else 1.0
+            flat_piece = pd.Series(
+                [prev_end] * len(test_candles),
+                index=pd.to_datetime(test_candles["timestamp"], unit="ms"),
+                dtype=float,
+            )
+            pieces.append(flat_piece)
             index += test_bars
             continue
 
         score, params, train_trades = best
         key = tuple(sorted(params.items()))
 
-        test_candles = candles.iloc[test_start:test_end].reset_index(drop=True)
         test_signals = signal_cache[key].iloc[test_start:test_end].reset_index(drop=True)
         test_result = run_backtest(
             test_candles,
@@ -261,6 +272,7 @@ def walk_forward(
             funding=funding,
             timeframe=timeframe,
             max_bars=max_bars,
+            min_notional=min_notional,
         )
 
         fold_return = test_result.final_equity / initial_equity - 1.0
@@ -298,10 +310,13 @@ def walk_forward(
     else:
         curve = pd.Series([initial_equity], dtype=float, name="equity")
 
-    metrics = compute_metrics(curve, all_trades, initial_equity, timeframe)
+    metrics = compute_metrics(
+        curve, all_trades, initial_equity, timeframe, n_trials=len(combos)
+    )
     metrics["folds"] = float(len(folds))
     metrics["folds_traded"] = float(sum(1 for f in folds if f.traded))
     metrics["folds_positive"] = float(sum(1 for f in folds if f.test_return_pct > 0))
+    metrics["trials_per_fold"] = float(len(combos))
     metrics["fees_paid"] = round(
         sum((f.result.metrics.get("fees_paid", 0.0) if f.result else 0.0) for f in folds), 2
     )
