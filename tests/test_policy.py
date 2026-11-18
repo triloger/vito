@@ -6,9 +6,10 @@ from vito.policy import Policy, PolicyError
 
 
 def test_shipped_policy_is_valid(policy: Policy) -> None:
-    assert policy.version == "1.1"
-    assert policy.risk.risk_per_trade_pct == 1.5
-    assert policy.risk.max_gross_exposure_mult == 3.0
+    assert policy.version == "1.2"
+    assert policy.risk.risk_per_trade_pct == 4.0
+    assert policy.risk.max_gross_exposure_mult == 2.5
+    assert policy.limits.peak_drawdown_stop_pct == 18.0
     assert policy.execution.mode == "readonly"
 
 
@@ -24,10 +25,11 @@ def test_digest_changes_when_a_cap_changes(make_policy) -> None:
     assert base.digest() != looser.digest()
 
 
-def test_conviction_tier_is_btc_only(policy: Policy) -> None:
-    assert policy.risk_fraction(conviction=True, instrument="BTC-USDT-SWAP") == 0.02
-    assert policy.risk_fraction(conviction=True, instrument="ETH-USDT-SWAP") == 0.015
-    assert policy.risk_fraction() == 0.015
+def test_conviction_tier_is_whitelisted_only(policy: Policy) -> None:
+    assert policy.risk_fraction(conviction=True, instrument="BTC-USDT-SWAP") == 0.045
+    assert policy.risk_fraction(conviction=True, instrument="QQQ-USDT-SWAP") == 0.045
+    assert policy.risk_fraction(conviction=True, instrument="ETH-USDT-SWAP") == 0.04
+    assert policy.risk_fraction() == 0.04
 
 
 def test_rejects_risk_above_ceiling(make_policy) -> None:

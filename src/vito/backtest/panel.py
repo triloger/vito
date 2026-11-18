@@ -47,11 +47,113 @@ DEFAULT_BASKET: tuple[str, ...] = (
     "SOL-USDT",
     "PAXG-USDT",
     "QQQ-USDT-SWAP",
+    "XAG-USDT-SWAP",
+)
+
+LEGACY_7_BASKET: tuple[str, ...] = (
+    "BTC-USDT",
+    "ETH-USDT",
+    "SOL-USDT",
+    "PAXG-USDT",
+    "QQQ-USDT-SWAP",
     "SPY-USDT-SWAP",
     "XAG-USDT-SWAP",
 )
 
 BARS_PER_YEAR = {"1h": 24 * 365, "4h": 6 * 365, "1d": 365}
+
+
+@dataclass(frozen=True, slots=True)
+class IndexGearState:
+    inst_id: str
+    last_close: float
+    sma_long: float
+    above_long_sma: bool
+    score_20d: float
+    ann_vol_20d_pct: float
+    gear_mult: float
+    reason: str
+
+
+def compute_index_gear(
+    sym: str,
+    *,
+    score_20d: float,
+    ann_vol_20d: float,
+    above_long_sma: bool,
+    max_gear: float = 3.0,
+    min_score: float = 5.5,
+    max_ann_vol: float = 0.17,
+) -> tuple[float, str]:
+    """Return ``(gear_mult, reason)`` for an equity-index perpetual slot.
+
+    Gearing is a reward for low volatility and confirmed trend:
+    - Base gear is ``1.0x``.
+    - Rises to ``max_gear`` (e.g. ``3.0x``) only when:
+      1. ``asset_group(sym) == "equity_index"``
+      2. ``above_long_sma`` is True (``close > 200-bar SMA``, min 20 bars warm-up)
+      3. ``score_20d >= min_score`` (top-tercile 20-day volatility-adjusted momentum)
+      4. ``ann_vol_20d <= max_ann_vol`` (bottom-half 20-day annualized realized vol)
+    """
+    if max_gear <= 1.0 or asset_group(sym) != "equity_index":
+        return 1.0, "base_1x"
+    if not above_long_sma:
+        return 1.0, "below_long_sma"
+    if not (math.isfinite(score_20d) and score_20d >= min_score):
+        return 1.0, f"score_{score_20d:.2f}<{min_score:.1f}"
+    if not (math.isfinite(ann_vol_20d) and ann_vol_20d <= max_ann_vol):
+        return 1.0, f"vol_{ann_vol_20d * 100:.1f}%>{max_ann_vol * 100:.0f}%"
+    return float(max_gear), f"low_vol_strong_trend_{max_gear:.1f}x"
+
+
+def evaluate_index_gear_at(
+    frames: dict[str, pd.DataFrame],
+    *,
+    lookback: int = 20,
+    max_gear: float = 3.0,
+    min_score: float = 5.5,
+    max_ann_vol: float = 0.17,
+) -> list[IndexGearState]:
+    """Evaluate point-in-time index-slot gearing state on the latest closed bar."""
+    out: list[IndexGearState] = []
+    for sym in sorted(frames):
+        if asset_group(sym) != "equity_index":
+            continue
+        df = frames[sym]
+        if df.empty or "close" not in df.columns:
+            continue
+        s = df["close"].astype(float).dropna()
+        if len(s) <= lookback:
+            continue
+        last_c = float(s.iloc[-1])
+        sma_long = float(s.rolling(200, min_periods=lookback).mean().iloc[-1])
+        ret = float(s.pct_change(lookback).iloc[-1])
+        vol = float(s.pct_change().rolling(lookback).std().iloc[-1])
+        score = ret / vol if (math.isfinite(vol) and vol > 1e-8) else 0.0
+        ann_vol = vol * math.sqrt(365.0) if math.isfinite(vol) else 1.0
+        above_long = bool(math.isfinite(sma_long) and last_c > sma_long and ret > 0)
+        gear, reason = compute_index_gear(
+            sym,
+            score_20d=score,
+            ann_vol_20d=ann_vol,
+            above_long_sma=above_long,
+            max_gear=max_gear,
+            min_score=min_score,
+            max_ann_vol=max_ann_vol,
+        )
+        out.append(
+            IndexGearState(
+                inst_id=sym,
+                last_close=round(last_c, 4),
+                sma_long=round(sma_long, 4),
+                above_long_sma=above_long,
+                score_20d=round(score, 2),
+                ann_vol_20d_pct=round(ann_vol * 100.0, 2),
+                gear_mult=gear,
+                reason=reason,
+            )
+        )
+    return out
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,7 +279,7 @@ def rank_panel_at(
     lookback: int = 20,
     max_positions: int = 2,
     atr_mult: float = 2.5,
-    max_per_group: int | None = None,
+    max_per_group: int | None = 1,
 ) -> list[tuple[str, float, float, float]]:
     """Rank instruments on the latest closed bar.
 
@@ -221,9 +323,10 @@ def run_panel_momentum(
     lookback: int = 20,
     rebalance_every: int = 5,
     max_positions: int = 2,
-    max_per_group: int | None = None,
-    max_gross_exposure_mult: float = 1.50,
-    risk_per_trade_pct: float = 3.0,
+    max_per_group: int | None = 1,
+    max_gross_exposure_mult: float = 2.50,
+    risk_per_trade_pct: float = 4.0,
+    index_gear_mult: float = 1.0,
     atr_mult: float = 2.5,
     use_stops: bool = True,
     initial_equity: float = 200.0,
@@ -248,13 +351,16 @@ def run_panel_momentum(
     cash_bar_rate = (cash_apr_pct / 100.0) / per_year if cash_apr_pct > 0 else 0.0
     min_notional_map = min_notional or {}
 
-    # Pre-compute strictly backward-looking momentum score at bar i close
+    # Pre-compute strictly backward-looking momentum score & index-gear inputs at bar i close
     scores: dict[str, np.ndarray] = {}
+    ann_vols: dict[str, np.ndarray] = {}
+    above_long_smas: dict[str, np.ndarray] = {}
     for sym in symbols:
         c = closes[sym]
         s = pd.Series(c)
         ret = s.pct_change(lookback)
         sma = s.rolling(lookback).mean()
+        sma_long = s.rolling(200, min_periods=lookback).mean()
         vol = s.pct_change().rolling(lookback).std()
         raw_score = np.where(
             (ret > 0.0) & (s > sma) & (vol > 1e-8),
@@ -262,6 +368,8 @@ def run_panel_momentum(
             -np.inf,
         )
         scores[sym] = raw_score
+        ann_vols[sym] = (vol * math.sqrt(per_year)).to_numpy(dtype=float)
+        above_long_smas[sym] = ((ret > 0.0) & (s > sma_long)).to_numpy(dtype=bool)
 
     equity = float(initial_equity)
     curve = np.full(n, initial_equity, dtype=float)
@@ -277,6 +385,7 @@ def run_panel_momentum(
     bars_since_rebalance = rebalance_every
     overlay_blocked_entries = 0
     overlay_scaled_allocs = 0
+    index_geared_allocs = 0
     blocked_forward_rets: list[float] = []
     asset_pnl: dict[str, float] = dict.fromkeys(symbols, 0.0)
     asset_bars: dict[str, int] = dict.fromkeys(symbols, 0)
@@ -355,7 +464,17 @@ def run_panel_momentum(
                 sym_scale = float(ov.scale_for(sym)) if ov is not None else 1.0
                 if sym_scale < 1.0:
                     overlay_scaled_allocs += 1
-                alloc = min(gross_cap_each, risk_notional) * sym_scale
+                prev_idx = max(0, i - 1)
+                idx_gear, _ = compute_index_gear(
+                    sym,
+                    score_20d=float(scores[sym][prev_idx]),
+                    ann_vol_20d=float(ann_vols[sym][prev_idx]),
+                    above_long_sma=bool(above_long_smas[sym][prev_idx]),
+                    max_gear=index_gear_mult,
+                )
+                if idx_gear > 1.0:
+                    index_geared_allocs += 1
+                alloc = min(gross_cap_each, risk_notional) * sym_scale * idx_gear
                 if alloc >= min_notional_map.get(sym, 0.0):
                     desired_notional[sym] = alloc
                     desired_stop_dist[sym] = safe_stop
@@ -498,6 +617,7 @@ def run_panel_momentum(
     metrics["exposure_pct"] = round(bars_invested / max(1, n - lookback) * 100, 1)
     metrics["stops_hit"] = float(stops_hit)
     metrics["cash_yield_usdt"] = round(total_cash_yield, 2)
+    metrics["index_geared_allocs"] = float(index_geared_allocs)
     if overlay_fn is not None:
         metrics["overlay_blocked_entries"] = float(overlay_blocked_entries)
         metrics["overlay_scaled_allocs"] = float(overlay_scaled_allocs)

@@ -13,18 +13,61 @@ Every live or shadow decision passes through the same policy checks:
 from __future__ import annotations
 
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import pandas as pd
 
-from vito.backtest.panel import rank_panel_at
+from vito.backtest.panel import (
+    IndexGearState,
+    evaluate_index_gear_at,
+    rank_panel_at,
+)
 from vito.exec.audit import AuditLog
 from vito.policy import Policy
 
 
 class ExecutionLocked(RuntimeError):
     """Raised when an order is attempted while the router is not armed."""
+
+
+def build_exchange_stop_payload(
+    inst_id: str,
+    *,
+    wallet: str,
+    qty: float,
+    stop_price: float,
+) -> dict[str, Any]:
+    """Construct the deterministic exchange-native protective stop order payload.
+
+    On Binance USDⓈ-M Futures (`wallet == "future"`), places a `STOP_MARKET`
+    reduce-only order triggered on `CONTRACT_PRICE` so 24/7 TradFi and crypto
+    perpetuals are protected on the exchange matching engine even if the VM is
+    offline. On Spot (`wallet == "spot"`), places a GTC `STOP_LOSS_LIMIT`.
+    """
+    if wallet == "future":
+        return {
+            "inst_id": inst_id,
+            "type": "STOP_MARKET",
+            "side": "sell",
+            "qty": round(qty, 8),
+            "params": {
+                "stopPrice": round(stop_price, 6),
+                "reduceOnly": True,
+                "workingType": "CONTRACT_PRICE",
+            },
+        }
+    return {
+        "inst_id": inst_id,
+        "type": "STOP_LOSS_LIMIT",
+        "side": "sell",
+        "qty": round(qty, 8),
+        "limit_price": round(stop_price * 0.998, 6),
+        "params": {
+            "stopPrice": round(stop_price, 6),
+            "timeInForce": "GTC",
+        },
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +83,9 @@ class ShadowOrder:
     qty: float
     executable: bool
     reason: str = ""
+    gear_mult: float = 1.0
+    shadow_geared_notional_usdt: float = 0.0
+    stop_order: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +101,7 @@ class ShadowPlan:
     deployed_usdt: float
     idle_cash_usdt: float
     audit_hash: str
+    index_gear: tuple[IndexGearState, ...] = ()
 
 
 def build_shadow_plan(
@@ -66,8 +113,11 @@ def build_shadow_plan(
     cash_usdt: float,
     lookback: int = 20,
     max_positions: int = 2,
-    max_exposure: float = 1.50,
-    risk_per_trade_pct: float = 3.0,
+    max_per_group: int | None = 1,
+    max_exposure: float = 2.50,
+    risk_per_trade_pct: float = 4.0,
+    index_gear_mult: float = 1.0,
+    shadow_index_gear_mult: float = 3.0,
     persist_audit: bool = True,
 ) -> ShadowPlan:
     """Evaluate the live account and market state, build the target portfolio, and log to audit."""
@@ -85,8 +135,19 @@ def build_shadow_plan(
     ranked = (
         []
         if (halted or below_floor or not frames)
-        else rank_panel_at(frames, lookback=lookback, max_positions=max_positions)
+        else rank_panel_at(
+            frames,
+            lookback=lookback,
+            max_positions=max_positions,
+            max_per_group=max_per_group,
+        )
     )
+    gear_states = (
+        tuple(evaluate_index_gear_at(frames, lookback=lookback, max_gear=shadow_index_gear_mult))
+        if frames
+        else ()
+    )
+    gear_by_sym = {g.inst_id: g for g in gear_states}
 
     gross_cap_each = (
         (equity_usdt * max_exposure) / max(1, len(ranked)) if ranked else 0.0
@@ -100,12 +161,21 @@ def build_shadow_plan(
     for sym, score, last_close, stop_d in ranked:
         safe_stop = max(policy.risk.min_stop_distance_pct / 100.0, stop_d)
         risk_notional = (equity_usdt * risk_frac) / safe_stop
-        alloc = round(min(gross_cap_each, risk_notional), 2)
+        base_alloc = min(gross_cap_each, risk_notional)
+        g_state = gear_by_sym.get(sym)
+        shadow_gear = g_state.gear_mult if g_state is not None else 1.0
+        active_gear = (
+            min(index_gear_mult, shadow_gear)
+            if (index_gear_mult > 1.0 and shadow_gear > 1.0)
+            else 1.0
+        )
+        alloc = round(base_alloc * active_gear, 2)
+        shadow_geared_alloc = round(base_alloc * shadow_gear, 2)
         exec_sym = sym
         wallet = "future" if sym.endswith("-SWAP") else "spot"
         # If adding another Spot position would exceed 75% of account cash when
         # total portfolio target > 1.0x, route non-BTC Spot legs to their -SWAP
-        # perpetual on USDⓈ-M Futures so 1.50x gross exposure is physically funded.
+        # perpetual on USDⓈ-M Futures so gross exposure is physically funded.
         if wallet == "spot" and (spot_used + alloc > max_spot_cash) and not sym.startswith("BTC-"):
             exec_sym = f"{sym}-SWAP"
             wallet = "future"
@@ -119,6 +189,15 @@ def build_shadow_plan(
             deployed += alloc
             if wallet == "spot":
                 spot_used += alloc
+        qty = round(alloc / last_close, 8) if (ok and last_close > 0) else 0.0
+        stop_px = round(last_close * (1.0 - safe_stop), 6)
+        stop_payload = (
+            build_exchange_stop_payload(
+                exec_sym, wallet=wallet, qty=qty, stop_price=stop_px
+            )
+            if ok
+            else {}
+        )
         orders.append(
             ShadowOrder(
                 inst_id=exec_sym,
@@ -126,12 +205,15 @@ def build_shadow_plan(
                 score=score,
                 ref_price=round(last_close, 6),
                 stop_distance_pct=round(safe_stop * 100.0, 2),
-                stop_price=round(last_close * (1.0 - safe_stop), 6),
+                stop_price=stop_px,
                 target_notional_usdt=alloc if ok else 0.0,
                 min_notional_usdt=min_not,
-                qty=round(alloc / last_close, 8) if (ok and last_close > 0) else 0.0,
+                qty=qty,
                 executable=ok,
                 reason=reason,
+                gear_mult=active_gear,
+                shadow_geared_notional_usdt=shadow_geared_alloc if ok else 0.0,
+                stop_order=stop_payload,
             )
         )
 
@@ -153,6 +235,7 @@ def build_shadow_plan(
                 "halted": halted,
                 "below_floor": below_floor,
                 "orders": [asdict(o) for o in orders],
+                "index_gear": [asdict(g) for g in gear_states],
             }
         )
 
@@ -168,6 +251,7 @@ def build_shadow_plan(
         deployed_usdt=round(deployed, 2),
         idle_cash_usdt=idle_cash,
         audit_hash=audit_hash,
+        index_gear=gear_states,
     )
 
 
@@ -224,7 +308,11 @@ class OrderRouter:
                     "sell",
                     qty,
                     None,
-                    {"stopPrice": stop_price, "reduceOnly": True},
+                    {
+                        "stopPrice": stop_price,
+                        "reduceOnly": True,
+                        "workingType": "CONTRACT_PRICE",
+                    },
                 )
             else:
                 stop_res = cli.create_order(

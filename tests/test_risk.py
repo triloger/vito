@@ -21,24 +21,24 @@ from vito.risk import (
 
 
 def test_size_is_driven_by_risk_not_leverage(policy: Policy) -> None:
-    """1.5% risk on $200 with a 1% stop is a $300 position, i.e. 1.5x."""
+    """4.0% risk on $200 with a 2% stop is a $400 position, i.e. 2.0x."""
     result = size_position(
-        SizeRequest(equity=200.0, instrument="BTC-USDT-SWAP", stop_distance=0.01),
+        SizeRequest(equity=200.0, instrument="BTC-USDT-SWAP", stop_distance=0.02),
         policy,
     )
     assert result.ok
-    assert result.notional == pytest.approx(300.0)
-    assert result.leverage == pytest.approx(1.5)
-    assert result.risk_amount == pytest.approx(3.0)
+    assert result.notional == pytest.approx(400.0)
+    assert result.leverage == pytest.approx(2.0)
+    assert result.risk_amount == pytest.approx(8.0)
     assert result.binding == "risk"
 
 
 def test_wider_stop_means_smaller_position(policy: Policy) -> None:
     tight = size_position(
-        SizeRequest(equity=200.0, instrument="BTC-USDT-SWAP", stop_distance=0.01), policy
+        SizeRequest(equity=200.0, instrument="BTC-USDT-SWAP", stop_distance=0.02), policy
     )
     wide = size_position(
-        SizeRequest(equity=200.0, instrument="BTC-USDT-SWAP", stop_distance=0.02), policy
+        SizeRequest(equity=200.0, instrument="BTC-USDT-SWAP", stop_distance=0.04), policy
     )
     assert wide.notional < tight.notional
     assert wide.risk_amount == pytest.approx(tight.risk_amount, rel=1e-3)
@@ -47,18 +47,18 @@ def test_wider_stop_means_smaller_position(policy: Policy) -> None:
 def test_conviction_raises_risk_only_for_whitelisted(policy: Policy) -> None:
     btc = size_position(
         SizeRequest(
-            equity=200.0, instrument="BTC-USDT-SWAP", stop_distance=0.01, conviction=True
+            equity=200.0, instrument="BTC-USDT-SWAP", stop_distance=0.02, conviction=True
         ),
         policy,
     )
     eth = size_position(
         SizeRequest(
-            equity=200.0, instrument="ETH-USDT-SWAP", stop_distance=0.01, conviction=True
+            equity=200.0, instrument="ETH-USDT-SWAP", stop_distance=0.02, conviction=True
         ),
         policy,
     )
-    assert btc.risk_amount == pytest.approx(4.0)
-    assert eth.risk_amount == pytest.approx(3.0)
+    assert btc.risk_amount == pytest.approx(9.0)
+    assert eth.risk_amount == pytest.approx(8.0)
 
 
 def test_leverage_cap_binds_when_risk_is_large(make_policy) -> None:
@@ -190,12 +190,12 @@ def test_max_leverage_for_stop_is_monotonic() -> None:
 
 def test_daily_halt_trips_at_limit(policy: Policy) -> None:
     assert not daily_loss_halt(-5.0, 200.0, policy)  # -2.5%
-    assert daily_loss_halt(-6.0, 200.0, policy)  # -3.0%
+    assert daily_loss_halt(-9.0, 200.0, policy)  # -4.5%
 
 
 def test_drawdown_halt_trips_at_limit(policy: Policy) -> None:
-    assert not drawdown_halt(200.0, 175.0, policy)  # -12.5%
-    assert drawdown_halt(200.0, 170.0, policy)  # -15%
+    assert not drawdown_halt(200.0, 169.0, policy)  # -15.5% (within 18% halt)
+    assert drawdown_halt(200.0, 164.0, policy)  # -18.0%
 
 
 def test_loss_streak_cooldown(policy: Policy) -> None:

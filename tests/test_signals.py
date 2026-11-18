@@ -14,6 +14,7 @@ from vito.signals import (
     RiskOverlay,
     calendar_digest,
     classify_fear_greed,
+    evaluate_market_clock,
     evaluate_overlay,
     events_within_window,
     fear_greed_at,
@@ -167,3 +168,32 @@ def test_panel_overlay_none_and_identity_reproduce_baseline() -> None:
     )
     assert half.final_equity < base.final_equity
     assert half.metrics["overlay_scaled_allocs"] > 0
+
+
+def test_market_clock_us_sessions_and_funding_guard() -> None:
+    # 2026-11-18 15:00 UTC == 10:00 EST (Wednesday, US Cash Open)
+    ts_open = 1_795_014_000_000
+    snap_open = evaluate_market_clock(
+        ts_open, symbols=("BTC-USDT", "QQQ-USDT-SWAP"), funding_guard_minutes=15
+    )
+    assert snap_open.us_session == "US_CASH_OPEN"
+    assert snap_open.us_cash_open is True
+    assert snap_open.funding_guard_active is False
+    assert len(snap_open.instruments) == 2
+    assert snap_open.instruments[1].liquid_window is True
+
+    # 2026-11-18 15:50 UTC (10 minutes before 16:00 UTC 8h funding) -> funding_guard_active True
+    ts_guard = 1_795_017_000_000
+    snap_guard = evaluate_market_clock(
+        ts_guard, symbols=("QQQ-USDT-SWAP",), funding_guard_minutes=15
+    )
+    assert snap_guard.funding_guard_active is True
+
+    # 2026-11-21 15:00 UTC (Saturday) -> WEEKEND_CLOSED
+    ts_wknd = 1_795_273_200_000
+    snap_wknd = evaluate_market_clock(
+        ts_wknd, symbols=("QQQ-USDT-SWAP",), funding_guard_minutes=15
+    )
+    assert snap_wknd.us_session == "WEEKEND_CLOSED"
+    assert snap_wknd.us_cash_open is False
+    assert snap_wknd.instruments[0].liquid_window is False

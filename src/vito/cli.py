@@ -60,6 +60,7 @@ from vito.signals import (
     build_panel_overlay_fn,
     calendar_digest,
     classify_fear_greed,
+    evaluate_market_clock,
     evaluate_overlay,
     events_within_window,
     fear_greed_at,
@@ -894,6 +895,8 @@ def cmd_paper_panel(args: argparse.Namespace) -> int:
         console.print("[red]no closed candles returned for panel[/red]")
         return 2
 
+    raw_mpg = getattr(args, "max_per_group", 1)
+    max_per_group = int(raw_mpg) if (raw_mpg is not None and int(raw_mpg) > 0) else None
     broker = PaperPanelBroker(
         policy=policy,
         symbols=symbols,
@@ -901,6 +904,7 @@ def cmd_paper_panel(args: argparse.Namespace) -> int:
         lookback=args.lookback,
         rebalance_every=args.rebalance_every,
         max_positions=args.max_positions,
+        max_per_group=max_per_group,
         max_exposure=args.max_exposure,
         risk_per_trade_pct=args.risk_pct,
         initial_equity=args.initial,
@@ -1162,6 +1166,9 @@ def cmd_panel(args: argparse.Namespace) -> int:
                 check_calendar=True,
             )
 
+    raw_mpg = getattr(args, "max_per_group", 1)
+    max_per_group = int(raw_mpg) if (raw_mpg is not None and int(raw_mpg) > 0) else None
+    index_gear = float(getattr(args, "index_gear", 1.0))
     try:
         result = run_panel_momentum(
             frames,
@@ -1169,9 +1176,10 @@ def cmd_panel(args: argparse.Namespace) -> int:
             lookback=args.lookback,
             rebalance_every=args.rebalance_every,
             max_positions=args.max_positions,
-            max_per_group=getattr(args, "max_per_group", None),
+            max_per_group=max_per_group,
             max_gross_exposure_mult=args.max_exposure,
             risk_per_trade_pct=args.risk_pct,
+            index_gear_mult=index_gear,
             initial_equity=args.initial,
             fee_bps=args.fee_bps,
             cash_apr_pct=args.cash_apr,
@@ -1250,6 +1258,11 @@ def cmd_panel(args: argparse.Namespace) -> int:
             f"[cyan]overlay · blocked entries {int(m['overlay_blocked_entries'])} "
             f"(avg 5d fwd {m['overlay_blocked_avg_5d_ret_pct']:+.2f}%) · "
             f"dampened allocations {int(m['overlay_scaled_allocs'])}[/cyan]"
+        )
+    if index_gear > 1.0:
+        console.print(
+            f"[cyan]index gear · {index_gear:.1f}x low-vol/top-tercile gear fired on "
+            f"{int(m.get('index_geared_allocs', 0))} rebalance(s)[/cyan]"
         )
     console.print(
         f"[dim]equal-weight basket buy & hold · return {b['total_return_pct']:+.2f}% "
@@ -1408,6 +1421,9 @@ def cmd_shadow(args: argparse.Namespace) -> int:
             except ExchangeUnavailable:
                 continue
 
+    raw_mpg = getattr(args, "max_per_group", 1)
+    max_per_group = int(raw_mpg) if (raw_mpg is not None and int(raw_mpg) > 0) else None
+    index_gear = float(getattr(args, "index_gear", 1.0))
     plan = build_shadow_plan(
         policy=policy,
         gateway=gateway,
@@ -1416,8 +1432,10 @@ def cmd_shadow(args: argparse.Namespace) -> int:
         cash_usdt=cash_usdt,
         lookback=args.lookback,
         max_positions=args.max_positions,
+        max_per_group=max_per_group,
         max_exposure=args.max_exposure,
         risk_per_trade_pct=args.risk_pct,
+        index_gear_mult=index_gear,
     )
 
     if args.json:
@@ -1425,10 +1443,11 @@ def cmd_shadow(args: argparse.Namespace) -> int:
         return 0
 
     console.print(_header(policy))
+    grp_tag = f"group_cap={max_per_group}" if max_per_group else "group_cap=None"
     console.print(
         f"[bold]Shadow Execution Plan[/bold] · "
         f"live equity [bold]{_money(plan.equity_usdt)}[/bold] USDT · "
-        f"risk {args.risk_pct:.1f}% / {args.max_exposure:.2f}x cap · "
+        f"risk {args.risk_pct:.1f}% / {args.max_exposure:.2f}x cap ({grp_tag}) · "
         f"Simple Earn [green]{plan.earn_apr_pct:.2f}% APR[/green] "
         f"(+{plan.daily_earn_usdt:.4f} USDT/day)"
     )
@@ -1489,9 +1508,9 @@ def cmd_shadow(args: argparse.Namespace) -> int:
             "Wallet",
             "Score",
             "Price",
-            "Stop",
+            "Stop (Native)",
             "Target USDT",
-            "Min USDT",
+            "Shadow 3x",
             "Status",
         )
         for col in cols:
@@ -1499,14 +1518,15 @@ def cmd_shadow(args: argparse.Namespace) -> int:
             table.add_column(col, justify=align)
         for o in plan.orders:
             status_str = "[green]READY[/green]" if o.executable else f"[yellow]{o.reason}[/yellow]"
+            stop_kind = o.stop_order.get("type", "STOP")
             table.add_row(
                 o.inst_id,
                 o.wallet,
                 f"{o.score:+.2f}",
                 f"{o.ref_price:,.2f}",
-                f"{o.stop_price:,.2f} (-{o.stop_distance_pct:.1f}%)",
+                f"{o.stop_price:,.2f} (-{o.stop_distance_pct:.1f}% {stop_kind})",
                 _money(o.target_notional_usdt),
-                _money(o.min_notional_usdt),
+                _money(o.shadow_geared_notional_usdt),
                 status_str,
             )
         console.print(table)
@@ -1516,7 +1536,116 @@ def cmd_shadow(args: argparse.Namespace) -> int:
             f"(+{plan.daily_earn_usdt:.4f} USDT/day)"
         )
 
+    if plan.index_gear:
+        g_title = (
+            "Index Slot Gearing "
+            "(Shadow 3.0x Gate: Close > 200d SMA & Score >= 5.5 & 20d Vol <= 17%)"
+        )
+        g_table = Table(
+            title=g_title,
+            title_justify="left",
+            header_style="bold",
+        )
+        g_cols = (
+            "Instrument",
+            "Last Close",
+            "200d SMA",
+            "20d Score",
+            "20d Ann Vol",
+            "Shadow Gear",
+            "Gate Status",
+        )
+        for col in g_cols:
+            align = "left" if col in ("Instrument", "Gate Status") else "right"
+            g_table.add_column(col, justify=align)
+        for g in plan.index_gear:
+            g_col = "green" if g.gear_mult > 1.0 else "dim"
+            g_table.add_row(
+                g.inst_id,
+                f"{g.last_close:,.2f}",
+                f"{g.sma_long:,.2f}",
+                f"{g.score_20d:+.2f}",
+                f"{g.ann_vol_20d_pct:.1f}%",
+                f"[{g_col}]{g.gear_mult:.1f}x[/{g_col}]",
+                g.reason,
+            )
+        console.print(g_table)
+
     console.print(f"[dim]audit hash: {plan.audit_hash[:16]}… ({policy.execution.audit_log})[/dim]")
+    return 0
+
+
+def cmd_clock(args: argparse.Namespace) -> int:
+    """Display the US cash session clock, 8h funding countdown, and evaluation schedule."""
+    policy = load_policy(args.policy)
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    now_ms = int(time.time() * 1000)
+    snap = evaluate_market_clock(
+        now_ms,
+        symbols=symbols,
+        funding_guard_minutes=policy.risk.funding_guard_minutes,
+    )
+    store = FeatureStore(Path("~/.vito/features.jsonl"))
+    feat_hash = store.append(
+        key="market_clock",
+        obs_ts=now_ms,
+        value={
+            "us_session": snap.us_session,
+            "us_cash_open": snap.us_cash_open,
+            "minutes_to_funding_8h": snap.minutes_to_funding_8h,
+            "funding_guard_active": snap.funding_guard_active,
+            "macro_within_24h": snap.macro_within_24h,
+        },
+        meta={"calendar_digest": snap.calendar_digest},
+    )
+
+    if args.json:
+        payload = snap.to_dict()
+        payload["feature_hash"] = feat_hash
+        console.print_json(json.dumps(payload, default=str))
+        return 0
+
+    console.print(_header(policy))
+    sess_col = "green" if snap.us_cash_open else "yellow"
+    guard_str = (
+        "[yellow]ACTIVE (within funding guard)[/yellow]"
+        if snap.funding_guard_active
+        else "[green]CLEAR[/green]"
+    )
+    console.print(
+        f"[bold]Market Clock[/bold] · UTC [cyan]{snap.iso_utc}[/cyan] · "
+        f"NY [cyan]{snap.iso_ny}[/cyan] · "
+        f"US Equity Session [{sess_col}]{snap.us_session}[/{sess_col}]"
+    )
+    h_2115 = snap.minutes_to_tradfi_eval_2115utc / 60.0
+    h_0012 = snap.minutes_to_crypto_eval_0012utc / 60.0
+    console.print(
+        f"  next US open: [bold]{snap.minutes_to_us_open / 60.0:.1f}h[/bold] · "
+        f"next US close: [bold]{snap.minutes_to_us_close / 60.0:.1f}h[/bold] · "
+        f"next 21:15 UTC TradFi eval: [bold]{h_2115:.1f}h[/bold] · "
+        f"next 00:12 UTC crypto eval: [bold]{h_0012:.1f}h[/bold]"
+    )
+    console.print(
+        f"  next 8h perp funding: [bold]{snap.next_funding_iso_utc}[/bold] "
+        f"(in {snap.minutes_to_funding_8h:.0f}m) · funding guard: {guard_str}"
+    )
+
+    table = Table(
+        title="Instrument Liquidity & Session Windows",
+        title_justify="left",
+        header_style="bold",
+    )
+    for col in ("Instrument", "Family", "Venue Book", "Underlying Session", "Window"):
+        table.add_column(col)
+    for row in snap.instruments:
+        w_str = (
+            "[green]LIQUID[/green]"
+            if row.liquid_window
+            else "[yellow]OFF-HOURS SYNTHETIC[/yellow]"
+        )
+        table.add_row(row.inst_id, row.family, row.venue_book, row.underlying_session, w_str)
+    console.print(table)
+    console.print(f"[dim]feature hash: {feat_hash[:16]}… (~/.vito/features.jsonl)[/dim]")
     return 0
 
 
@@ -1643,11 +1772,17 @@ def build_parser() -> argparse.ArgumentParser:
     panel.add_argument(
         "--max-per-group",
         type=int,
-        default=None,
-        help="max positions per correlation family (e.g. 1 prevents double-crypto or double-metal)",
+        default=1,
+        help="max positions per correlation family (default: 1; pass 0 to disable)",
     )
-    panel.add_argument("--risk-pct", type=float, default=3.0)
-    panel.add_argument("--max-exposure", type=float, default=1.50)
+    panel.add_argument("--risk-pct", type=float, default=4.0)
+    panel.add_argument("--max-exposure", type=float, default=2.50)
+    panel.add_argument(
+        "--index-gear",
+        type=float,
+        default=1.0,
+        help="gear multiplier on equity-index slots in low-vol/top-tercile uptrends (e.g. 3.0)",
+    )
     panel.add_argument("--initial", type=float, default=200.0)
     panel.add_argument("--fee-bps", type=float, default=5.0)
     panel.add_argument(
@@ -1674,6 +1809,14 @@ def build_parser() -> argparse.ArgumentParser:
     signals.add_argument("--json", action="store_true")
     signals.set_defaults(func=cmd_signals)
 
+    clock = sub.add_parser(
+        "clock",
+        help="inspect US equity cash session, 8h funding countdown, and evaluation schedule",
+    )
+    clock.add_argument("--symbols", default=",".join(DEFAULT_BASKET))
+    clock.add_argument("--json", action="store_true")
+    clock.set_defaults(func=cmd_clock)
+
     shadow = sub.add_parser(
         "shadow",
         help="evaluate live equity, Simple Earn yield, and intended orders into the audit chain",
@@ -1682,9 +1825,11 @@ def build_parser() -> argparse.ArgumentParser:
     shadow.add_argument("--timeframe", default="1d", choices=sorted(TIMEFRAME_MS))
     shadow.add_argument("--lookback", type=int, default=20)
     shadow.add_argument("--max-positions", type=int, default=2)
-    shadow.add_argument("--risk-pct", type=float, default=3.0)
-    shadow.add_argument("--max-exposure", type=float, default=1.50)
-    shadow.add_argument("--bars", type=int, default=100)
+    shadow.add_argument("--max-per-group", type=int, default=1)
+    shadow.add_argument("--risk-pct", type=float, default=4.0)
+    shadow.add_argument("--max-exposure", type=float, default=2.50)
+    shadow.add_argument("--index-gear", type=float, default=1.0)
+    shadow.add_argument("--bars", type=int, default=250)
     shadow.add_argument("--equity", type=float, default=200.0)
     shadow.add_argument("--json", action="store_true")
     shadow.set_defaults(func=cmd_shadow)
@@ -1718,8 +1863,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_panel.add_argument("--lookback", type=int, default=20)
     p_panel.add_argument("--rebalance-every", type=int, default=5)
     p_panel.add_argument("--max-positions", type=int, default=2)
-    p_panel.add_argument("--risk-pct", type=float, default=3.0)
-    p_panel.add_argument("--max-exposure", type=float, default=1.50)
+    p_panel.add_argument("--max-per-group", type=int, default=1)
+    p_panel.add_argument("--risk-pct", type=float, default=4.0)
+    p_panel.add_argument("--max-exposure", type=float, default=2.50)
     p_panel.add_argument("--initial", type=float, default=200.0)
     p_panel.add_argument("--fee-bps", type=float, default=5.0)
     p_panel.add_argument("--bars", type=int, default=100)

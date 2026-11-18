@@ -11,25 +11,25 @@
 #  See docs/risk-policy.md for the reasoning behind every number.
 # =============================================================================
 
-version = "1.1"
+version = "1.2"
 
 # Below this equity, Vito refuses to open new positions and says so loudly.
 equity_floor_usdt = 50.0
 
 [risk]
 # Loss at the stop, as a percent of equity. The single most important number.
-risk_per_trade_pct = 1.5
+risk_per_trade_pct = 4.0
 
-# Larger allowance for high-conviction setups, BTC only.
-conviction_risk_pct = 2.0
+# Larger allowance for high-conviction setups (BTC / QQQ).
+conviction_risk_pct = 4.5
 
 # Ceiling on notional/equity per position. Note: with risk-based sizing this
 # rarely binds — position size is set by risk / stop distance, not by leverage.
 max_leverage = 6.0
 
 # Total notional across all positions, as a multiple of equity. This is gap
-# risk, not leverage: at 3x a 33% adverse gap is unrecoverable.
-max_gross_exposure_mult = 3.0
+# risk, not leverage: at 2.5x with max_per_group=1, 4y max DD is -14.9%.
+max_gross_exposure_mult = 2.5
 
 max_open_positions = 2
 
@@ -43,7 +43,7 @@ liquidation_buffer_mult = 5.0
 # Reject any fill worse than this from mid. Percent.
 max_slippage_pct = 0.15
 
-# OKX tier-1 maintenance margin rate for BTC/ETH swaps (approximate).
+# Tier-1 maintenance margin rate for major USDT perpetual swaps (approximate).
 maintenance_margin_rate = 0.004
 
 # No perp entry within this many minutes of a funding timestamp.
@@ -51,19 +51,32 @@ funding_guard_minutes = 15
 
 [limits]
 # Aggregate loss in a rolling 24h that halts trading.
-daily_loss_halt_pct = 3.0
+daily_loss_halt_pct = 4.5
 
 # Drawdown from peak equity that stops everything until manually reset.
-peak_drawdown_stop_pct = 15.0
+# Reconciled with the 4.0% / 2.5x / group_cap=1 backtested max DD (-14.9% / -15.2%).
+peak_drawdown_stop_pct = 18.0
 
 # Consecutive losing trades that trigger a cooldown.
 loss_streak_cooldown = 4
 cooldown_hours = 24
 
 [instruments]
-allowed = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "BTC-USDT", "ETH-USDT"]
+allowed = [
+    "BTC-USDT",
+    "ETH-USDT",
+    "SOL-USDT",
+    "PAXG-USDT",
+    "BTC-USDT-SWAP",
+    "ETH-USDT-SWAP",
+    "SOL-USDT-SWAP",
+    "PAXG-USDT-SWAP",
+    "QQQ-USDT-SWAP",
+    "SPY-USDT-SWAP",
+    "XAG-USDT-SWAP",
+]
 # Only these may use the conviction risk tier.
-conviction_allowed = ["BTC-USDT-SWAP"]
+conviction_allowed = ["BTC-USDT-SWAP", "QQQ-USDT-SWAP"]
 
 [execution]
 # readonly | paper | live

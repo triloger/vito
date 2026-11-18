@@ -80,16 +80,18 @@ In Vito, you never crank a "leverage knob" blindly. You choose **how much of you
 
 $$\text{Position Size} = \frac{\text{Account Equity} \times \text{Risk \%}}{\text{Stop Distance}}$$
 
-Here is how the exact same 7-asset Hybrid Basket + Simple Earn (`8% APR` conservative cash yield) performed over **4 years of real Binance data (`2022-12-10 → 2026-11-18`)** starting with **$93.16 USDT**:
+Here is how the Hybrid Basket + Simple Earn (`8% APR` conservative cash yield) performed over **4 years of real Binance data (`2022-12-10 → 2026-11-18`)** starting with **$93.16 USDT**:
 
-| Profile | Risk / Trade (`--risk-pct`) | Max Exposure (`--max-exposure`) | $93.16 Grows To | Total Return (CAGR) | Worst Drawdown | Sharpe (`t`-stat) |
-|---|---:|---:|---:|---:|---:|---:|
-| **Conservative** | `1.5%` | `0.75x` | **$234.48** | **+151.7%** (+26.4%/yr) | **−7.4%** | 2.13 (`+4.22`) |
-| **Balanced (Full Spot)** | `2.0%` | `1.00x` | **$281.42** | **+202.1%** (+32.4%/yr) | **−10.2%** | 1.97 (`+3.90`) |
-| **Aggressive** | `2.5%` | `1.25x` | **$332.19** | **+256.6%** (+38.1%/yr) | **−12.9%** | 1.85 (`+3.67`) |
-| **Full Throttle (Default)** | `3.0%` | `1.50x` | **$386.84** | **+315.2%** (+43.5%/yr) | **−15.6%** | 1.76 (`+3.50`) |
+| Profile | Risk / Trade (`--risk-pct`) | Max Exposure (`--max-exposure`) | Group Cap (`--max-per-group`) | $93.16 Grows To | Total Return (CAGR) | Worst Drawdown | Sharpe (`t`-stat) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **Conservative** | `1.5%` | `0.75x` | `None` | **$234.48** | **+151.7%** (+26.4%/yr) | **−7.4%** | 2.13 (`+4.22`) |
+| **Balanced (Full Spot)** | `2.0%` | `1.00x` | `None` | **$281.42** | **+202.1%** (+32.4%/yr) | **−10.2%** | 1.97 (`+3.90`) |
+| **Full Throttle 1.0** | `3.0%` | `1.50x` | `None` | **$386.84** | **+315.2%** (+43.5%/yr) | **−15.6%** | 1.76 (`+3.50`) |
+| **Risk Budget 2.0 (Default)** | `4.0%` | `2.50x` | `1` | **$432.46** | **+364.1%** (+47.6%/yr) | **−14.9%** | **1.85 (`+3.68`)** |
+| **Risk Budget 2.0 + Index 3x Gear** | `4.0%` | `2.50x` | `1` | **$436.43** | **+368.4%** (+47.9%/yr) | **−18.0%** | 1.72 (`+3.41`) |
+| **Risk Budget 2.0 Uncapped** | `4.0%` | `2.50x` | `0` | **$615.54** | **+560.6%** (+61.4%/yr) | **−20.5%** | 1.77 (`+3.52`) |
 
-*(For comparison, buying and holding all 7 assets equally returned +294.98% but suffered a **−44.0% drawdown**, and during the Apr–Nov 2026 crypto slide where the equal-weight basket lost **−13.53%**, Vito made **+15.12% (CAGR +28.49%) with a −10.3% max drawdown** by rotating into `QQQ`, `XAG`, `PAXG`, and `SPY`.)*
+*(For comparison, buying and holding the basket equally returned +281.19% but suffered a **−46.0% drawdown**.)*
 
 ---
 
@@ -107,11 +109,14 @@ python3 -m venv .venv
 
 ### 1. Run the 4-Year Cross-Asset Momentum Backtest
 ```bash
-# Default dial: 3.0% risk/trade, 1.50x max exposure, 8% Simple Earn cash yield
+# Default dial (Risk Budget 2.0): 4.0% risk/trade, 2.50x max exposure, 1 position per family, 8% Simple Earn cash yield
 .venv/bin/vito panel --initial 100 --days 1460
 
+# Enable 3.0x Index Slot Gearing (gears QQQ-USDT-SWAP 3x when Close > 200d SMA, 20d score >= 5.5, and 20d vol <= 17%):
+.venv/bin/vito panel --initial 100 --days 1460 --index-gear 3.0
+
 # Or try the Conservative dial (1.5% risk, 0.75x exposure):
-.venv/bin/vito panel --initial 100 --days 1460 --risk-pct 1.5 --max-exposure 0.75
+.venv/bin/vito panel --initial 100 --days 1460 --risk-pct 1.5 --max-exposure 0.75 --max-per-group 0
 ```
 
 ### 2. Connect Your Binance Account (Read-Only First)
@@ -125,7 +130,9 @@ It prompts for your API Key and Secret with hidden input (`getpass`), saves `.en
 ### 3. Daily Commands
 ```bash
 .venv/bin/vito status        # Live market prices, funding APRs, your total USDT (incl. Simple Earn), and active guards
-.venv/bin/vito shadow        # Live Shadow Execution Plan: checks regime, Simple Earn APR, and exact intended orders
+.venv/bin/vito shadow        # Live Shadow Execution Plan: regime, Simple Earn APR, intended orders, native STOP_MARKET, and 3x Index Gear radar
+.venv/bin/vito clock         # US equity cash session state, 21:15 UTC TradFi timer, 8h funding countdown, and liquidity windows
+.venv/bin/vito signals       # Live Fear & Greed, FOMC/CPI calendar, and trailing 1y funding percentiles
 .venv/bin/vito paper panel   # Step the live paper portfolio forward on newly closed daily candles
 .venv/bin/vito paper status  # View paper trading scoreboard
 .venv/bin/vito instruments   # Scan all Binance Spot + Futures markets that fit a small account
