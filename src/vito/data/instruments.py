@@ -37,15 +37,75 @@ COMMODITY_BASES = {
     "XPT",
     "XPD",
     "XCU",
+    "COPPER",
     "CL",
     "BZ",
     "NG",
+    "NATGAS",
     "H100",
     "USO",
     "XUSO",
     "URNM",
     "XURNM",
 }
+
+PRECIOUS_METALS_BASES = {"PAXG", "XAU", "XAUT", "XAG", "XPT", "XPD", "GDX"}
+INDUSTRIAL_METALS_BASES = {"COPPER", "XCU", "URNM", "XURNM", "CCJ", "MP", "CRML"}
+ENERGY_BASES = {"CL", "BZ", "NATGAS", "NG", "USO", "XUSO", "XLE", "XOM", "OXY", "EQT"}
+EQUITY_INDEX_BASES = {
+    "QQQ",
+    "SPY",
+    "IWM",
+    "SMH",
+    "SOXX",
+    "EWZ",
+    "EWJ",
+    "EWY",
+    "EWT",
+    "TQQQ",
+    "SQQQ",
+    "KODEX200",
+}
+PRE_IPO_BASES = {"OPENAI", "ANTHROPIC", "SPCX", "MINIMAX", "ZHIPU"}
+
+
+def asset_group(inst_id_or_base: str) -> str:
+    """Return correlation family for group-capped portfolio construction."""
+    raw = str(inst_id_or_base).upper()
+    base = raw.split("-")[0].split("/")[0]
+    if base in PRECIOUS_METALS_BASES:
+        return "precious_metals"
+    if base in INDUSTRIAL_METALS_BASES:
+        return "industrial_metals"
+    if base in ENERGY_BASES:
+        return "energy"
+    if base in EQUITY_INDEX_BASES:
+        return "equity_index"
+    if base in PRE_IPO_BASES:
+        return "pre_ipo"
+    return "crypto"
+
+
+def is_true_perpetual(market: dict[str, Any]) -> bool:
+    """Return False if a swap market is settling, inactive, or has a near-term delivery date."""
+    if not market.get("active", True):
+        return False
+    info = market.get("info") or {}
+    status = str(info.get("status") or "").upper()
+    if status and status not in ("TRADING", "LIVE"):
+        return False
+    if str(market.get("type") or "") == "swap":
+        sym = str(market.get("symbol") or "")
+        if ":" in sym and "-" in sym.split(":")[-1]:
+            return False
+        delivery = info.get("deliveryDate")
+        if delivery is not None:
+            try:
+                if 0 < int(delivery) < 4_000_000_000_000:
+                    return False
+            except (TypeError, ValueError):
+                pass
+    return True
 
 CRYPTO_X_BASES = {
     "XRP",
@@ -160,8 +220,20 @@ def evaluate_market(
     limits = market.get("limits") or {}
     limits_amt = limits.get("amount") or {}
     limits_cost = limits.get("cost") or {}
-    min_size = float(limits_amt.get("min") or info.get("minSz") or 0.0)
-    min_cost = float(limits_cost.get("min") or 0.0)
+    raw_min_sz = limits_amt.get("min") or info.get("minSz")
+    raw_min_cost = limits_cost.get("min")
+    try:
+        min_size = float(raw_min_sz) if raw_min_sz is not None else 0.0
+    except (TypeError, ValueError):
+        min_size = 0.0
+    try:
+        min_cost = float(raw_min_cost) if raw_min_cost is not None else 0.0
+    except (TypeError, ValueError):
+        min_cost = 0.0
+    if min_size != min_size:  # NaN check
+        min_size = 0.0
+    if min_cost != min_cost:  # NaN check
+        min_cost = 0.0
     prec = market.get("precision") or {}
     tick_size = float(prec.get("price") or info.get("tickSz") or 0.0)
 
@@ -184,6 +256,8 @@ def evaluate_market(
     reasons: list[str] = []
     if not active:
         reasons.append("inactive")
+    if not is_true_perpetual(market) and "inactive" not in reasons:
+        reasons.append("settling_or_dated")
     if ref_price <= 0:
         reasons.append("unpriced")
     if min_notional_usdt <= 0 or min_notional_usdt > max_order_usdt:

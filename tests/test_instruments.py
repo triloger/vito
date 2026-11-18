@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from vito.data.instruments import classify_asset, evaluate_market
+from vito.data.instruments import (
+    asset_group,
+    classify_asset,
+    evaluate_market,
+    is_true_perpetual,
+)
+from vito.exchange.binance import canonical_inst_id
 
 
 def test_classify_asset_uses_okx_inst_category() -> None:
@@ -145,3 +151,41 @@ def test_evaluate_binance_swap_respects_min_cost_floor() -> None:
     # 0.01 * 80 = $0.80, but min_cost is $5.00 -> effective min_notional is $5.00
     assert spec.min_notional_usdt == pytest.approx(5.0)
     assert spec.tradeable is True
+
+
+def test_dated_and_settling_contracts_are_rejected_and_grouped() -> None:
+    dated = {
+        "id": "ANTHROPICUSDT_261117",
+        "symbol": "ANTHROPIC/USDT:USDT-261117",
+        "type": "swap",
+        "linear": True,
+        "quote": "USDT",
+        "base": "ANTHROPIC",
+        "active": True,
+        "contractSize": 1.0,
+        "limits": {"amount": {"min": 0.01}, "cost": {"min": float("nan")}},
+        "precision": {"price": 0.01},
+        "maker": 0.0002,
+        "taker": 0.0005,
+        "info": {
+            "contractType": "TRADIFI_PERPETUAL",
+            "status": "SETTLING",
+            "deliveryDate": "1794913200000",
+            "underlyingType": "PREMARKET",
+        },
+    }
+    assert canonical_inst_id(dated) == "ANTHROPIC-USDT-261117"
+    assert is_true_perpetual(dated) is False
+    ticker = {"last": 1252.52, "bid": 1252.0, "ask": 1253.0, "quoteVolume": 90_000_000.0}
+    spec = evaluate_market(dated, ticker, max_order_usdt=150.0)
+    assert spec is not None
+    assert spec.tradeable is False
+    assert "settling_or_dated" in spec.reject_reason
+
+    assert asset_group("PAXG-USDT") == "precious_metals"
+    assert asset_group("XAG-USDT-SWAP") == "precious_metals"
+    assert asset_group("CL-USDT-SWAP") == "energy"
+    assert asset_group("COPPER-USDT-SWAP") == "industrial_metals"
+    assert asset_group("QQQ-USDT-SWAP") == "equity_index"
+    assert asset_group("OPENAI-USDT-SWAP") == "pre_ipo"
+    assert asset_group("BTC-USDT") == "crypto"

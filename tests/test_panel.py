@@ -3,7 +3,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from vito.backtest.panel import run_panel_momentum
+from vito.backtest.panel import rank_panel_at, run_panel_momentum
 
 STEP = 86_400_000
 
@@ -102,3 +102,18 @@ def test_paper_panel_broker_warms_up_and_steps(tmp_path) -> None:
     assert s.status == "stepped"
     assert s.bars_processed == 10
     assert s.state.equity > s.state.initial_equity
+
+
+def test_panel_max_per_group_prevents_same_family_concentration() -> None:
+    n = 50
+    # Two precious metals (PAXG, XAG) outperforming one equity index (QQQ)
+    paxg = _frame([100.0 * (1.015 ** (i + (i % 3) * 0.1)) for i in range(n)])
+    xag = _frame([100.0 * (1.012 ** (i + (i % 3) * 0.1)) for i in range(n)])
+    qqq = _frame([100.0 * (1.008 ** (i + (i % 3) * 0.1)) for i in range(n)])
+    frames = {"PAXG-USDT": paxg, "XAG-USDT-SWAP": xag, "QQQ-USDT-SWAP": qqq}
+
+    uncapped = rank_panel_at(frames, lookback=15, max_positions=2, max_per_group=None)
+    assert [r[0] for r in uncapped] == ["PAXG-USDT", "XAG-USDT-SWAP"]
+
+    capped = rank_panel_at(frames, lookback=15, max_positions=2, max_per_group=1)
+    assert [r[0] for r in capped] == ["PAXG-USDT", "QQQ-USDT-SWAP"]

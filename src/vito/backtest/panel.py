@@ -38,6 +38,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from vito.data.instruments import asset_group
 from vito.strategy.indicators import atr
 
 DEFAULT_BASKET: tuple[str, ...] = (
@@ -149,12 +150,34 @@ def align_panel(
     return ts, opens, highs, lows, closes, stop_dists
 
 
+def _select_top_candidates(
+    candidates: list[tuple[float, str, float, float]],
+    *,
+    max_positions: int,
+    max_per_group: int | None = None,
+) -> list[tuple[float, str, float, float]]:
+    if max_per_group is None or max_per_group <= 0:
+        return candidates[:max_positions]
+    selected: list[tuple[float, str, float, float]] = []
+    counts: dict[str, int] = {}
+    for item in candidates:
+        grp = asset_group(item[1])
+        if counts.get(grp, 0) >= max_per_group:
+            continue
+        counts[grp] = counts.get(grp, 0) + 1
+        selected.append(item)
+        if len(selected) >= max_positions:
+            break
+    return selected
+
+
 def rank_panel_at(
     frames: dict[str, pd.DataFrame],
     *,
     lookback: int = 20,
     max_positions: int = 2,
     atr_mult: float = 2.5,
+    max_per_group: int | None = None,
 ) -> list[tuple[str, float, float, float]]:
     """Rank instruments on the latest closed bar.
 
@@ -182,9 +205,12 @@ def rank_panel_at(
         ):
             candidates.append((ret / vol, sym, last_close, stop_d))
     candidates.sort(reverse=True)
+    picked = _select_top_candidates(
+        candidates, max_positions=max_positions, max_per_group=max_per_group
+    )
     return [
         (sym, round(score, 4), last_close, round(stop_d, 4))
-        for score, sym, last_close, stop_d in candidates[:max_positions]
+        for score, sym, last_close, stop_d in picked
     ]
 
 
@@ -195,6 +221,7 @@ def run_panel_momentum(
     lookback: int = 20,
     rebalance_every: int = 5,
     max_positions: int = 2,
+    max_per_group: int | None = None,
     max_gross_exposure_mult: float = 1.50,
     risk_per_trade_pct: float = 3.0,
     atr_mult: float = 2.5,
@@ -431,14 +458,17 @@ def run_panel_momentum(
         ):
             ranked = sorted(
                 (
-                    (float(scores[sym][i]), sym, float(stop_dists[sym][i]))
+                    (float(scores[sym][i]), sym, 0.0, float(stop_dists[sym][i]))
                     for sym in symbols
                     if math.isfinite(float(scores[sym][i])) and float(scores[sym][i]) > 0
                 ),
                 reverse=True,
             )
-            if ranked or holdings:
-                pending_targets = tuple((sym, sd) for _, sym, sd in ranked[:max_positions])
+            picked = _select_top_candidates(
+                ranked, max_positions=max_positions, max_per_group=max_per_group
+            )
+            if picked or holdings:
+                pending_targets = tuple((sym, sd) for _, sym, _, sd in picked)
 
     index = pd.to_datetime(ts, unit="ms")
     curve_series = pd.Series(curve, index=index, name="equity")

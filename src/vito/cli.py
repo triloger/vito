@@ -1169,6 +1169,7 @@ def cmd_panel(args: argparse.Namespace) -> int:
             lookback=args.lookback,
             rebalance_every=args.rebalance_every,
             max_positions=args.max_positions,
+            max_per_group=getattr(args, "max_per_group", None),
             max_gross_exposure_mult=args.max_exposure,
             risk_per_trade_pct=args.risk_pct,
             initial_equity=args.initial,
@@ -1639,6 +1640,12 @@ def build_parser() -> argparse.ArgumentParser:
     panel.add_argument("--lookback", type=int, default=20)
     panel.add_argument("--rebalance-every", type=int, default=5)
     panel.add_argument("--max-positions", type=int, default=2)
+    panel.add_argument(
+        "--max-per-group",
+        type=int,
+        default=None,
+        help="max positions per correlation family (e.g. 1 prevents double-crypto or double-metal)",
+    )
     panel.add_argument("--risk-pct", type=float, default=3.0)
     panel.add_argument("--max-exposure", type=float, default=1.50)
     panel.add_argument("--initial", type=float, default=200.0)

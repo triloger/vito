@@ -9,6 +9,7 @@ paper broker are venue-agnostic.
 from __future__ import annotations
 
 import contextlib
+import math
 from typing import Any
 
 import ccxt
@@ -29,9 +30,13 @@ def canonical_inst_id(market: dict[str, Any]) -> str:
     raw_id = str(market.get("id") or "")
     if "-" in raw_id:
         return raw_id
+    symbol = str(market.get("symbol") or "")
     base = str(market.get("base") or "").upper()
     quote = str(market.get("quote") or "USDT").upper()
     m_type = str(market.get("type") or "")
+    if ":" in symbol and "-" in symbol.split(":")[-1]:
+        suffix = symbol.split(":")[-1].split("-", 1)[1]
+        return f"{base}-{quote}-{suffix}"
     if m_type == "swap" and base and quote:
         return f"{base}-{quote}-SWAP"
     if m_type == "spot" and base and quote:
@@ -193,10 +198,23 @@ class BinanceGateway:
             price = self.ticker(inst_id).mid
         except ExchangeUnavailable:  # pragma: no cover - network
             price = 0.0
-        contract = float(market.get("contractSize") or 1.0)
+        if not math.isfinite(price) or price <= 0:
+            price = 0.0
+        raw_cs = market.get("contractSize")
+        contract = (
+            float(raw_cs)
+            if raw_cs is not None and math.isfinite(float(raw_cs)) and float(raw_cs) > 0
+            else 1.0
+        )
         limits = market.get("limits") or {}
-        min_amount = float((limits.get("amount") or {}).get("min") or 0.0)
-        min_cost = float((limits.get("cost") or {}).get("min") or 0.0)
+        raw_amt = (limits.get("amount") or {}).get("min")
+        raw_cost = (limits.get("cost") or {}).get("min")
+        min_amount = (
+            float(raw_amt) if raw_amt is not None and math.isfinite(float(raw_amt)) else 0.0
+        )
+        min_cost = (
+            float(raw_cost) if raw_cost is not None and math.isfinite(float(raw_cost)) else 5.0
+        )
         return max(contract * min_amount * price, min_cost)
 
     def swap_tickers(self) -> dict[str, dict[str, Any]]:
