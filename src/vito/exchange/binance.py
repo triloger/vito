@@ -234,6 +234,29 @@ class BinanceGateway:
             p_val = round(price, 6)
         return q_val, p_val
 
+    def sellable_spot_qty(self, inst_id: str, fallback_qty: float) -> float:
+        """Return actual free Spot balance for ``inst_id`` truncated to ``LOT_SIZE``.
+
+        When a Spot market buy fills without BNB fee discount, Binance deducts
+        the ~0.10% fee from the base asset, leaving slightly less than
+        ``fallback_qty``. Truncating ``min(fallback_qty, free_base)`` to
+        ``LOT_SIZE`` prevents ``Insufficient balance`` on subsequent Spot stop or
+        exit orders.
+        """
+        market = self._market(inst_id)
+        if market.get("type") != "spot" or not self.has_credentials:
+            q_val, _ = self.round_order(inst_id, fallback_qty, 0.0)
+            return q_val
+        base = str(market.get("base") or "").upper()
+        free_base = fallback_qty
+        with contextlib.suppress(Exception):
+            raw_s = self._spot_client.fetch_balance({"type": "spot"})
+            avail = float((raw_s.get("free") or {}).get(base) or 0.0)
+            if avail > 0:
+                free_base = min(fallback_qty, avail)
+        q_val, _ = self.round_order(inst_id, free_base, 0.0)
+        return q_val
+
     def swap_tickers(self) -> dict[str, dict[str, Any]]:
         """Fetch all linear swap tickers including bid/ask from bookTicker."""
         try:

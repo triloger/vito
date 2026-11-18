@@ -1713,9 +1713,19 @@ def cmd_execute(args: argparse.Namespace) -> int:
 
     exec_result = None
     if getattr(args, "arm", None):
-        router = OrderRouter(policy)
+        expected_digest = policy.digest()
+        if str(args.arm) != expected_digest:
+            console.print(
+                f"[red]Execution locked:[/red] digest mismatch: policy is "
+                f"{expected_digest}, re-read `vito policy` and try again"
+            )
+            return 1
+        raw_pol = policy.as_dict()
+        raw_pol["execution"]["mode"] = "live"
+        live_policy = Policy.from_dict(raw_pol)
+        router = OrderRouter(live_policy)
         try:
-            router.arm(str(args.arm))
+            router.arm(live_policy.digest())
             exec_result = router.execute_runbook(runbook, gateway=gateway)
         except ExecutionLocked as exc:
             console.print(f"[red]Execution locked:[/red] {exc}")

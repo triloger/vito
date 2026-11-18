@@ -739,8 +739,15 @@ class OrderRouter:
                 m = gateway._market(step.inst_id)  # noqa: SLF001
                 cli = gateway._client_for(m)  # noqa: SLF001
                 side = str(step.params.get("side") or "sell")
+                exec_qty = step.qty
+                if (
+                    side == "sell"
+                    and step.wallet == "spot"
+                    and hasattr(gateway, "sellable_spot_qty")
+                ):
+                    exec_qty = gateway.sellable_spot_qty(step.inst_id, step.qty)
                 params = {"reduceOnly": True} if step.params.get("reduceOnly") else {}
-                res = cli.create_order(m["symbol"], "market", side, step.qty, None, params)
+                res = cli.create_order(m["symbol"], "market", side, exec_qty, None, params)
             elif act == "PLACE_STOP":
                 m = gateway._market(step.inst_id)  # noqa: SLF001
                 cli = gateway._client_for(m)  # noqa: SLF001
@@ -758,16 +765,21 @@ class OrderRouter:
                         },
                     )
                 else:
+                    stop_qty = (
+                        gateway.sellable_spot_qty(step.inst_id, step.qty)
+                        if hasattr(gateway, "sellable_spot_qty")
+                        else step.qty
+                    )
                     _, lim_px = (
-                        gateway.round_order(step.inst_id, step.qty, step.stop_price * 0.998)
+                        gateway.round_order(step.inst_id, stop_qty, step.stop_price * 0.998)
                         if hasattr(gateway, "round_order")
-                        else (step.qty, round(step.stop_price * 0.998, 6))
+                        else (stop_qty, round(step.stop_price * 0.998, 6))
                     )
                     res = cli.create_order(
                         m["symbol"],
                         "STOP_LOSS_LIMIT",
                         "sell",
-                        step.qty,
+                        stop_qty,
                         lim_px,
                         {"stopPrice": step.stop_price, "timeInForce": "GTC"},
                     )
