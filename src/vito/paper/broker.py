@@ -662,7 +662,7 @@ class PaperPanelBroker:
                         h["stop"] = round(max(float(h["stop"]), c_px * (1.0 - sd)), 4)
 
             bars_since += 1
-            if bars_since >= self.rebalance_every:
+            if bars_since >= self.rebalance_every or not holdings:
                 sliced = {
                     s: df.loc[df["timestamp"] <= int(ts[i])].reset_index(drop=True)
                     for s, df in frames.items()
@@ -670,9 +670,11 @@ class PaperPanelBroker:
                 ranked = rank_panel_at(
                     sliced, lookback=self.lookback, max_positions=self.max_positions
                 )
-                state.params["pending_targets"] = [
-                    {"sym": s, "score": sc, "stop_dist": sd} for s, sc, _, sd in ranked
-                ]
+                if ranked or holdings:
+                    state.params["pending_targets"] = [
+                        {"sym": s, "score": sc, "stop_dist": sd}
+                        for s, sc, _, sd in ranked
+                    ]
 
         state.params["bars_since_rebalance"] = bars_since
         state.last_bar_ts = int(ts[-1])

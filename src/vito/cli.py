@@ -1294,6 +1294,42 @@ def cmd_shadow(args: argparse.Namespace) -> int:
             f"({_money(plan.idle_cash_usdt)} USDT) in Simple Earn Flexible "
             f"@ {plan.earn_apr_pct:.2f}% APR[/cyan]"
         )
+        radar = Table(
+            title="Trigger Radar (Daily Close Needed to Enter Tomorrow's Open)",
+            title_justify="left",
+            header_style="bold",
+        )
+        rcols = (
+            "Instrument",
+            "Last Close",
+            "20d SMA",
+            "20d Ago Close",
+            "Trigger Price",
+            "Distance",
+        )
+        for col in rcols:
+            radar.add_column(col, justify="left" if col == "Instrument" else "right")
+        rows_radar: list[tuple[float, str, float, float, float, float]] = []
+        for sym, df in frames.items():
+            c = df["close"].astype(float).dropna()
+            if len(c) <= args.lookback:
+                continue
+            last_c = float(c.iloc[-1])
+            sma_c = float(c.rolling(args.lookback).mean().iloc[-1])
+            ago_c = float(c.iloc[-(args.lookback + 1)])
+            trig = max(sma_c, ago_c)
+            dist = (trig / last_c - 1.0) * 100.0 if last_c > 0 else 0.0
+            rows_radar.append((dist, sym, last_c, sma_c, ago_c, trig))
+        for dist, sym, last_c, sma_c, ago_c, trig in sorted(rows_radar):
+            radar.add_row(
+                sym,
+                f"{last_c:,.2f}",
+                f"{sma_c:,.2f}",
+                f"{ago_c:,.2f}",
+                f"{trig:,.2f}",
+                f"+{dist:.2f}%",
+            )
+        console.print(radar)
     else:
         table = Table(title="Intended Orders", title_justify="left", header_style="bold")
         cols = (

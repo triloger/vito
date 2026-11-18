@@ -84,12 +84,12 @@ Here is how the exact same 7-asset Hybrid Basket + Simple Earn (`8% APR` conserv
 
 | Profile | Risk / Trade (`--risk-pct`) | Max Exposure (`--max-exposure`) | $93.16 Grows To | Total Return (CAGR) | Worst Drawdown | Sharpe (`t`-stat) |
 |---|---:|---:|---:|---:|---:|---:|
-| **Conservative** | `1.5%` | `0.75x` | **$200.44** | **+115.1%** (+21.4%/yr) | **−10.2%** | 1.89 (`+3.74`) |
-| **Balanced (Full Spot)** | `2.0%` | `1.00x` | **$230.53** | **+147.4%** (+25.8%/yr) | **−14.5%** | 1.70 (`+3.37`) |
-| **Aggressive** | `2.5%` | `1.25x` | **$264.68** | **+184.1%** (+30.3%/yr) | **−18.7%** | 1.59 (`+3.16`) |
-| **Full Throttle (Default)** | `3.0%` | `1.50x` | **$303.64** | **+225.9%** (+34.9%/yr) | **−22.6%** | 1.52 (`+3.02`) |
+| **Conservative** | `1.5%` | `0.75x` | **$234.48** | **+151.7%** (+26.4%/yr) | **−7.4%** | 2.13 (`+4.22`) |
+| **Balanced (Full Spot)** | `2.0%` | `1.00x` | **$281.42** | **+202.1%** (+32.4%/yr) | **−10.2%** | 1.97 (`+3.90`) |
+| **Aggressive** | `2.5%` | `1.25x` | **$332.19** | **+256.6%** (+38.1%/yr) | **−12.9%** | 1.85 (`+3.67`) |
+| **Full Throttle (Default)** | `3.0%` | `1.50x` | **$386.84** | **+315.2%** (+43.5%/yr) | **−15.6%** | 1.76 (`+3.50`) |
 
-*(For comparison, buying and holding all 7 assets equally suffered a **−44.0% drawdown**, and during the Apr–Nov 2026 crypto slide where the equal-weight basket lost **−13.53%**, Vito made **+7.12% with an −8.3% max drawdown** by rotating into `QQQ`, `XAG`, and `SPY`.)*
+*(For comparison, buying and holding all 7 assets equally returned +294.98% but suffered a **−44.0% drawdown**, and during the Apr–Nov 2026 crypto slide where the equal-weight basket lost **−13.53%**, Vito made **+15.12% (CAGR +28.49%) with a −10.3% max drawdown** by rotating into `QQQ`, `XAG`, `PAXG`, and `SPY`.)*
 
 ---
 

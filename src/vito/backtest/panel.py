@@ -244,6 +244,7 @@ def run_panel_momentum(
     total_cash_yield = 0.0
     stops_hit = 0
     bars_invested = 0
+    bars_since_rebalance = rebalance_every
     asset_pnl: dict[str, float] = dict.fromkeys(symbols, 0.0)
     asset_bars: dict[str, int] = dict.fromkeys(symbols, 0)
 
@@ -342,6 +343,7 @@ def run_panel_momentum(
             total_turnover += turnover
             holdings = new_holdings
             stops = new_stops
+            bars_since_rebalance = 0
             avg_alloc = (
                 sum(desired_notional.values()) / len(desired_notional)
                 if desired_notional
@@ -397,9 +399,16 @@ def run_panel_momentum(
             equity += cy
             total_cash_yield += cy
         curve[i] = equity
+        bars_since_rebalance += 1
 
-        # 2. At close of bar i, decide if next open is a rebalance
-        if i >= lookback and (i - lookback) % rebalance_every == 0 and i + 1 < n:
+        # 2. At close of bar i, decide if next open is a rebalance.
+        # While sitting in cash (not holdings), check every bar so a new uptrend
+        # is entered on the very next open rather than waiting up to 5 bars.
+        if (
+            i >= lookback
+            and (bars_since_rebalance >= rebalance_every or not holdings)
+            and i + 1 < n
+        ):
             ranked = sorted(
                 (
                     (float(scores[sym][i]), sym, float(stop_dists[sym][i]))
@@ -408,7 +417,8 @@ def run_panel_momentum(
                 ),
                 reverse=True,
             )
-            pending_targets = tuple((sym, sd) for _, sym, sd in ranked[:max_positions])
+            if ranked or holdings:
+                pending_targets = tuple((sym, sd) for _, sym, sd in ranked[:max_positions])
 
     index = pd.to_datetime(ts, unit="ms")
     curve_series = pd.Series(curve, index=index, name="equity")
