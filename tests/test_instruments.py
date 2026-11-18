@@ -11,6 +11,43 @@ def test_classify_asset_uses_okx_inst_category() -> None:
     assert classify_asset({"base": "XAU", "info": {"instCategory": "4"}}) == "commodity"
 
 
+def test_classify_asset_uses_binance_tradfi_metadata() -> None:
+    assert (
+        classify_asset(
+            {
+                "base": "QQQ",
+                "info": {
+                    "contractType": "TRADIFI_PERPETUAL",
+                    "underlyingType": "EQUITY",
+                    "underlyingSubType": ["TradFi"],
+                },
+            }
+        )
+        == "equity"
+    )
+    assert (
+        classify_asset(
+            {
+                "base": "XAU",
+                "info": {
+                    "contractType": "TRADIFI_PERPETUAL",
+                    "underlyingType": "COMMODITY",
+                },
+            }
+        )
+        == "commodity"
+    )
+    assert (
+        classify_asset(
+            {
+                "base": "BTC",
+                "info": {"contractType": "PERPETUAL", "underlyingType": "COIN"},
+            }
+        )
+        == "crypto"
+    )
+
+
 def test_classify_asset_fallback_distinguishes_crypto_x_tokens() -> None:
     assert classify_asset({"base": "XRP", "info": {}}) == "crypto"
     assert classify_asset({"base": "XLM", "info": {}}) == "crypto"
@@ -83,3 +120,28 @@ def test_evaluate_market_rejects_illiquid_and_wide_spread() -> None:
     assert "min_notional>150" in spec.reject_reason
     assert "illiquid" in spec.reject_reason
     assert "wide_spread" in spec.reject_reason
+
+
+def test_evaluate_binance_swap_respects_min_cost_floor() -> None:
+    market = {
+        "id": "SOLUSDT",
+        "symbol": "SOL/USDT:USDT",
+        "type": "swap",
+        "linear": True,
+        "quote": "USDT",
+        "base": "SOL",
+        "active": True,
+        "contractSize": 1.0,
+        "limits": {"amount": {"min": 0.01}, "cost": {"min": 5.0}},
+        "precision": {"price": 0.01},
+        "maker": 0.0002,
+        "taker": 0.0005,
+        "info": {"contractType": "PERPETUAL", "underlyingType": "COIN"},
+    }
+    ticker = {"last": 80.0, "bid": 79.99, "ask": 80.01, "quoteVolume": 50_000_000.0}
+    spec = evaluate_market(market, ticker, max_order_usdt=150.0)
+    assert spec is not None
+    assert spec.inst_id == "SOL-USDT-SWAP"
+    # 0.01 * 80 = $0.80, but min_cost is $5.00 -> effective min_notional is $5.00
+    assert spec.min_notional_usdt == pytest.approx(5.0)
+    assert spec.tradeable is True

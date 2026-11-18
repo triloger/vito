@@ -47,7 +47,7 @@ from vito.data.ohlcv import (
     fetch_funding,
     fetch_recent,
 )
-from vito.exchange.okx import ExchangeUnavailable, MissingCredentials, OkxGateway
+from vito.exchange import ExchangeUnavailable, MissingCredentials, build_gateway
 from vito.network import EgressStatus, check_egress, fetch_egress_ip
 from vito.paper import PaperBroker, PaperPanelBroker, load_state
 from vito.policy import Policy, PolicyError, load_policy
@@ -181,13 +181,13 @@ def cmd_status(args: argparse.Namespace) -> int:
     policy = load_policy(args.policy)
     settings = load_settings(repo_root())
     credentials = load_credentials()
-    gateway = OkxGateway(credentials)
+    gateway = build_gateway(credentials)
     halted = kill_switch_engaged(policy.execution.kill_switch_file)
 
     try:
         rows = market_rows(gateway, settings.symbols)
     except ExchangeUnavailable as exc:
-        console.print(f"[red]OKX unreachable:[/red] {exc}")
+        console.print(f"[red]Exchange unreachable:[/red] {exc}")
         return 2
 
     snapshot: Snapshot | None = None
@@ -234,12 +234,11 @@ def cmd_status(args: argparse.Namespace) -> int:
             Panel(
                 f"[yellow]{reason}[/yellow]\n\n"
                 "Read-only account access:\n"
-                "  1. create a [bold]sub-account[/bold] on OKX with only your risk capital\n"
-                "  2. API key with [bold]Read[/bold] only, withdraw disabled,\n"
+                "  1. create a [bold]sub-account[/bold] on Binance with only your risk capital\n"
+                "  2. API key with [bold]Reading[/bold] only, withdraw disabled,\n"
                 "     IP allowlist enabled\n"
-                "  3. copy [cyan].env.example[/cyan] to [cyan].env[/cyan], fill in the values\n"
-                "  4. re-run [bold]vito status[/bold]\n\n"
-                "Full walkthrough: [cyan]docs/okx-setup.md[/cyan]",
+                "  3. run [bold]vito setup[/bold] (hidden input, writes mode-0600 .env)\n"
+                "  4. re-run [bold]vito status[/bold]",
                 title="Account",
                 title_align="left",
                 border_style="yellow",
@@ -355,9 +354,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         )
     )
 
-    gateway = OkxGateway(credentials)
+    gateway = build_gateway(credentials)
     reachable = gateway.ping()
-    checks.append(_check("okx reachable", reachable, "api/v5" if reachable else "no response"))
+    venue_label = getattr(gateway, "venue", "binance")
+    checks.append(
+        _check(f"{venue_label} reachable", reachable, "api ok" if reachable else "no response")
+    )
     failures += not reachable
 
     settings = load_settings(repo_root())
@@ -416,47 +418,54 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
-    """Prompt for OKX credentials with echo disabled and write mode-0600 `.env`."""
+    """Prompt for exchange credentials with echo disabled and write mode-0600 `.env`."""
+    venue = str(getattr(args, "venue", "binance") or "binance").lower()
+    venue_title = venue.upper()
     console.print(
         Panel(
-            "Enter your [bold]Read-only[/bold] OKX sub-account API credentials.\n"
+            f"Enter your [bold]{venue_title}[/bold] sub-account API credentials.\n"
             "Input is hidden (nothing is echoed to the terminal or shell history).",
             title="Vito Setup",
             title_align="left",
             border_style="cyan",
         )
     )
-    api_key = getpass.getpass("OKX API Key (hidden): ").strip()
-    api_secret = getpass.getpass("OKX API Secret (hidden): ").strip()
-    passphrase = getpass.getpass("OKX Passphrase (hidden): ").strip()
+    api_key = getpass.getpass(f"{venue_title} API Key (hidden): ").strip()
+    api_secret = getpass.getpass(f"{venue_title} API Secret (hidden): ").strip()
+    passphrase = (
+        getpass.getpass("OKX Passphrase (hidden): ").strip() if venue == "okx" else ""
+    )
 
     creds = Credentials(
         api_key=api_key,
         api_secret=api_secret,
         passphrase=passphrase,
         demo=bool(args.demo),
+        venue=venue,
     )
     if not creds.complete:
-        console.print("[red]setup aborted: all three fields are required[/red]")
+        console.print("[red]setup aborted: required credential fields were empty[/red]")
         return 1
 
     env_path = write_env_credentials(
-        api_key, api_secret, passphrase, demo=bool(args.demo)
+        api_key, api_secret, passphrase, demo=bool(args.demo), venue=venue
     )
     console.print(
         f"[green]✓[/green] wrote [cyan]{env_path}[/cyan] (mode 0600) · "
-        f"key [bold]{creds.masked()}[/bold]"
+        f"venue [bold]{venue}[/bold] · key [bold]{creds.masked()}[/bold]"
     )
 
-    gateway = OkxGateway(creds)
+    gateway = build_gateway(creds)
     try:
         snapshot = build_snapshot(gateway)
     except ExchangeUnavailable as exc:
-        console.print(f"[yellow]saved .env, but OKX rejected the check:[/yellow] {exc}")
+        console.print(
+            f"[yellow]saved .env, but {venue_title} rejected the check:[/yellow] {exc}"
+        )
         return 2
 
     console.print(
-        f"[green]✓[/green] authenticated with OKX · "
+        f"[green]✓[/green] authenticated with {venue_title} · "
         f"total equity [bold]{_money(snapshot.total_usdt)}[/bold] USDT"
     )
     return 0
@@ -469,7 +478,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
 def cmd_backtest(args: argparse.Namespace) -> int:
     policy = load_policy(args.policy)
-    gateway = OkxGateway(load_credentials())
+    gateway = build_gateway(load_credentials())
 
     with console.status(f"fetching {args.symbol} {args.timeframe}…", spinner="dots"):
         candles = fetch_candles(
@@ -595,7 +604,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
 
 def cmd_walkforward(args: argparse.Namespace) -> int:
     policy = load_policy(args.policy)
-    gateway = OkxGateway(load_credentials())
+    gateway = build_gateway(load_credentials())
 
     with console.status(f"fetching {args.symbol} {args.timeframe}…", spinner="dots"):
         candles = fetch_candles(
@@ -730,7 +739,7 @@ def _parse_params(values: list[str] | None) -> dict[str, object]:
 
 def cmd_paper_step(args: argparse.Namespace) -> int:
     policy = load_policy(args.policy)
-    gateway = OkxGateway(load_credentials())
+    gateway = build_gateway(load_credentials())
 
     with console.status(f"fetching {args.symbol} {args.timeframe}…", spinner="dots"):
         raw = fetch_recent(gateway, args.symbol, timeframe=args.timeframe, limit=args.bars)
@@ -851,7 +860,7 @@ def cmd_paper_status(args: argparse.Namespace) -> int:
 
 def cmd_paper_panel(args: argparse.Namespace) -> int:
     policy = load_policy(args.policy)
-    gateway = OkxGateway(load_credentials())
+    gateway = build_gateway(load_credentials())
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
 
     frames = {}
@@ -997,7 +1006,7 @@ def cmd_net(args: argparse.Namespace) -> int:
 
 def cmd_instruments(args: argparse.Namespace) -> int:
     policy = load_policy(args.policy)
-    gateway = OkxGateway(load_credentials())
+    gateway = build_gateway(load_credentials())
 
     with console.status("scanning OKX instruments…", spinner="dots"):
         specs = scan_instruments(
@@ -1099,7 +1108,7 @@ def cmd_instruments(args: argparse.Namespace) -> int:
 
 def cmd_panel(args: argparse.Namespace) -> int:
     policy = load_policy(args.policy)
-    gateway = OkxGateway(load_credentials())
+    gateway = build_gateway(load_credentials())
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
 
     frames = {}
@@ -1235,9 +1244,10 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.set_defaults(func=cmd_doctor)
 
     setup = sub.add_parser(
-        "setup", help="prompt for OKX credentials (hidden input) and write mode-0600 .env"
+        "setup", help="prompt for exchange credentials (hidden input) and write mode-0600 .env"
     )
-    setup.add_argument("--demo", action="store_true", help="enable OKX demo/sandbox mode")
+    setup.add_argument("--venue", default="binance", choices=("binance", "okx"))
+    setup.add_argument("--demo", action="store_true", help="enable demo/sandbox mode")
     setup.set_defaults(func=cmd_setup)
 
     net = sub.add_parser("net", help="show egress IP and whether it matches the allowlist")

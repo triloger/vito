@@ -4,9 +4,9 @@ Before testing a strategy on an instrument, two physical constraints must hold:
 
 1. **Order size fits the account.** On a $200 account with a 1.5% risk budget
    and a 2% stop, target notional is $150 (0.75x equity). If the exchange's
-   minimum order (`contractSize * minSz * price`) exceeds the position cap, or
-   forces effective exposure above the ceiling, the instrument is untradeable
-   at this account size.
+   minimum order (`max(contractSize * minSz * price, minCost)`) exceeds the
+   position cap, or forces effective exposure above the ceiling, the instrument
+   is untradeable at this account size.
 2. **The book is liquid enough that backtest fills are not fiction.** Thin
    books with wide spreads turn historical close-to-open backtests into wishful
    thinking. A hard liquidity gate (`volume_24h_usdt >= 100_000` and
@@ -20,7 +20,8 @@ from typing import Any
 
 import ccxt
 
-from vito.exchange.okx import ExchangeUnavailable, OkxGateway
+from vito.exchange.binance import canonical_inst_id
+from vito.exchange.okx import ExchangeUnavailable
 
 INST_CATEGORY_MAP = {
     "1": "crypto",
@@ -90,7 +91,7 @@ class InstrumentSpec:
 
 
 def classify_asset(market: dict[str, Any]) -> str:
-    """Classify an OKX market into ``crypto``, ``equity``, or ``commodity``."""
+    """Classify a Binance or OKX market into ``crypto``, ``equity``, or ``commodity``."""
     info = market.get("info") or {}
     cat = str(info.get("instCategory") or "")
     if cat in INST_CATEGORY_MAP:
@@ -99,6 +100,15 @@ def classify_asset(market: dict[str, Any]) -> str:
     base = str(market.get("base") or "").upper()
     if base in COMMODITY_BASES:
         return "commodity"
+
+    underlying = str(info.get("underlyingType") or "").upper()
+    contract_type = str(info.get("contractType") or "").upper()
+    subtypes = [str(s).upper() for s in (info.get("underlyingSubType") or [])]
+    if underlying == "COMMODITY" or "COMMODITY" in subtypes:
+        return "commodity"
+    if underlying == "EQUITY" or contract_type == "TRADIFI_PERPETUAL" or "TRADFI" in subtypes:
+        return "equity"
+
     if base.startswith("X") and base not in CRYPTO_X_BASES and len(base) > 1:
         return "equity"
     return "crypto"
@@ -121,7 +131,7 @@ def evaluate_market(
     if str(market.get("quote") or "") != "USDT":
         return None
 
-    inst_id = str(market.get("id") or "")
+    inst_id = canonical_inst_id(market)
     symbol = str(market.get("symbol") or "")
     active = bool(market.get("active", True))
     info = market.get("info") or {}
@@ -137,36 +147,37 @@ def evaluate_market(
         (ask - bid) / mid * 10_000.0 if (bid > 0 and ask > 0 and mid > 0) else float("inf")
     )
 
-    # OKX ticker volume semantics:
-    # - For USDT spot, info.volCcy24h is quote volume in USDT.
-    # - For linear USDT swaps, info.volCcy24h is base volume (in underlying coins/shares).
     vol_ccy = float(t_info.get("volCcy24h") or 0.0)
     if vol_ccy > 0:
         volume_24h_usdt = vol_ccy * last if kind == "swap" else vol_ccy
     else:
-        qvol = float(t.get("quoteVolume") or 0.0)
+        qvol = float(t.get("quoteVolume") or t_info.get("quoteVolume") or 0.0)
         bvol = float(t.get("baseVolume") or 0.0)
         contract_val = float(market.get("contractSize") or 1.0)
         volume_24h_usdt = qvol if qvol > 0 else bvol * contract_val * last
 
     contract_size = float(market.get("contractSize") or 1.0)
-    limits_amt = (market.get("limits") or {}).get("amount") or {}
+    limits = market.get("limits") or {}
+    limits_amt = limits.get("amount") or {}
+    limits_cost = limits.get("cost") or {}
     min_size = float(limits_amt.get("min") or info.get("minSz") or 0.0)
+    min_cost = float(limits_cost.get("min") or 0.0)
     prec = market.get("precision") or {}
     tick_size = float(prec.get("price") or info.get("tickSz") or 0.0)
 
     ref_price = mid if mid > 0 else last
-    min_notional_usdt = contract_size * min_size * ref_price
+    lot_notional = contract_size * min_size * ref_price
+    min_notional_usdt = max(lot_notional, min_cost) if ref_price > 0 else 0.0
 
     maker_bps = float(market.get("maker") or 0.0) * 10_000.0
     taker_bps = float(market.get("taker") or 0.0) * 10_000.0
     try:
-        max_leverage = float(info.get("lever") or (1.0 if kind == "spot" else 0.0))
+        max_leverage = float(info.get("lever") or (1.0 if kind == "spot" else 20.0))
     except (TypeError, ValueError):
-        max_leverage = 1.0 if kind == "spot" else 0.0
+        max_leverage = 1.0 if kind == "spot" else 20.0
 
     try:
-        list_time_ms = int(info.get("listTime") or 0)
+        list_time_ms = int(info.get("listTime") or info.get("onboardDate") or 0)
     except (TypeError, ValueError):
         list_time_ms = 0
 
@@ -205,7 +216,7 @@ def evaluate_market(
 
 
 def scan_instruments(
-    gateway: OkxGateway,
+    gateway: Any,
     *,
     kind: str = "all",
     asset_class: str = "all",
@@ -215,17 +226,23 @@ def scan_instruments(
     max_spread_bps: float = 10.0,
     only_tradeable: bool = True,
 ) -> list[InstrumentSpec]:
-    """Scan OKX USDT spot and linear swap markets and apply the liquidity/sizing gate."""
+    """Scan USDT spot and linear swap markets and apply the liquidity/sizing gate."""
     markets = gateway.markets()
     max_order_usdt = equity * max_exposure_mult
 
     swap_tickers: dict[str, dict[str, Any]] = {}
     spot_tickers: dict[str, dict[str, Any]] = {}
     try:
-        if kind in ("all", "swap"):
-            swap_tickers = gateway.client.fetch_tickers(params={"instType": "SWAP"})
-        if kind in ("all", "spot"):
-            spot_tickers = gateway.client.fetch_tickers(params={"instType": "SPOT"})
+        if hasattr(gateway, "swap_tickers"):
+            if kind in ("all", "swap"):
+                swap_tickers = gateway.swap_tickers()
+            if kind in ("all", "spot"):
+                spot_tickers = gateway.spot_tickers()
+        else:
+            if kind in ("all", "swap"):
+                swap_tickers = gateway.client.fetch_tickers(params={"instType": "SWAP"})
+            if kind in ("all", "spot"):
+                spot_tickers = gateway.client.fetch_tickers(params={"instType": "SPOT"})
     except ccxt.BaseError as exc:  # pragma: no cover - network
         raise ExchangeUnavailable(str(exc)) from exc
 

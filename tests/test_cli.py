@@ -23,6 +23,8 @@ def test_cli_imports_cover_every_module() -> None:
         "vito.policy",
         "vito.data.market",
         "vito.data.instruments",
+        "vito.exchange",
+        "vito.exchange.binance",
         "vito.exchange.okx",
         "vito.portfolio.snapshot",
         "vito.risk.limits",

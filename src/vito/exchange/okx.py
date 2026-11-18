@@ -81,6 +81,8 @@ class OkxGateway:
     with an opaque exchange error.
     """
 
+    venue: str = "okx"
+
     def __init__(self, credentials: Credentials | None = None, *, timeout_ms: int = 15_000):
         self.credentials = credentials or Credentials()
         self._markets: dict[str, dict] | None = None
