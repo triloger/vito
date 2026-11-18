@@ -19,6 +19,7 @@ import getpass
 import json
 import platform
 import sys
+import time
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -54,6 +55,20 @@ from vito.paper import PaperBroker, PaperPanelBroker, load_state
 from vito.policy import Policy, PolicyError, load_policy
 from vito.portfolio.snapshot import Snapshot, build_snapshot
 from vito.risk import kill_switch_engaged
+from vito.signals import (
+    FeatureStore,
+    build_panel_overlay_fn,
+    calendar_digest,
+    classify_fear_greed,
+    evaluate_overlay,
+    events_within_window,
+    fear_greed_at,
+    fetch_fear_greed,
+    fetch_funding_panel,
+    funding_percentile_at,
+    latest_funding_rate_at,
+    next_macro_event,
+)
 from vito.strategy import STRATEGIES, build
 
 console = Console()
@@ -1134,6 +1149,19 @@ def cmd_panel(args: argparse.Namespace) -> int:
         console.print("[red]no candles returned for basket[/red]")
         return 2
 
+    overlay_fn = None
+    if getattr(args, "overlay", False):
+        with console.status("fetching Fear & Greed + funding crowding history…", spinner="dots"):
+            fng_series = fetch_fear_greed(refresh=args.refresh)
+            fund_series = fetch_funding_panel(
+                gateway, symbols, days=max(args.days + 365, 1460), refresh=args.refresh
+            )
+            overlay_fn = build_panel_overlay_fn(
+                fng_series=fng_series,
+                funding_series=fund_series,
+                check_calendar=True,
+            )
+
     try:
         result = run_panel_momentum(
             frames,
@@ -1147,6 +1175,7 @@ def cmd_panel(args: argparse.Namespace) -> int:
             fee_bps=args.fee_bps,
             cash_apr_pct=args.cash_apr,
             min_notional=min_notional,
+            overlay_fn=overlay_fn,
         )
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
@@ -1215,11 +1244,133 @@ def cmd_panel(args: argparse.Namespace) -> int:
         f"stops {int(m.get('stops_hit', 0))} · "
         f"exposure {m['exposure_pct']:.1f}% · fees {m['fees_paid']:.2f} USDT{cy_note}"
     )
+    if "overlay_blocked_entries" in m:
+        console.print(
+            f"[cyan]overlay · blocked entries {int(m['overlay_blocked_entries'])} "
+            f"(avg 5d fwd {m['overlay_blocked_avg_5d_ret_pct']:+.2f}%) · "
+            f"dampened allocations {int(m['overlay_scaled_allocs'])}[/cyan]"
+        )
     console.print(
         f"[dim]equal-weight basket buy & hold · return {b['total_return_pct']:+.2f}% "
         f"(CAGR {b['cagr_pct']:+.2f}%) · max DD {b['max_drawdown_pct']:.1f}% · "
         f"sharpe {b['sharpe']:.2f} (t={b['t_stat']:+.2f})[/dim]"
     )
+    return 0
+
+
+def cmd_signals(args: argparse.Namespace) -> int:
+    """Display live Tier-1 signals (Fear & Greed, funding crowding, FOMC/CPI calendar)."""
+    policy = load_policy(args.policy)
+    gateway = build_gateway(load_credentials())
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    now_ms = int(time.time() * 1000)
+
+    msg = "fetching Fear & Greed, macro calendar, and funding crowding…"
+    with console.status(msg, spinner="dots"):
+        fng_series = fetch_fear_greed(refresh=args.refresh)
+        fg_val = fear_greed_at(fng_series, now_ms)
+        fund_map = fetch_funding_panel(gateway, symbols, days=365, refresh=args.refresh)
+        fund_pcts = {sym: funding_percentile_at(s, now_ms) for sym, s in fund_map.items()}
+        fund_rates = {sym: latest_funding_rate_at(s, now_ms) for sym, s in fund_map.items()}
+        ov = evaluate_overlay(
+            now_ms,
+            fear_greed=fg_val,
+            funding_pct=fund_pcts,
+            check_calendar=True,
+        )
+        next_ev = next_macro_event(now_ms)
+        upcoming_24h = events_within_window(now_ms, hours_ahead=24.0)
+
+    store = FeatureStore(Path("~/.vito/features.jsonl"))
+    feat_hash = store.append(
+        key="signals_snapshot",
+        obs_ts=now_ms,
+        value={
+            "fear_greed": fg_val,
+            "funding_pct": fund_pcts,
+            "risk_scale": ov.risk_scale,
+            "block_new_entries": ov.block_new_entries,
+            "reasons": list(ov.reasons),
+        },
+        meta={"calendar_digest": calendar_digest()},
+    )
+
+    if args.json:
+        console.print_json(
+            json.dumps(
+                {
+                    "timestamp_ms": now_ms,
+                    "fear_greed": fg_val,
+                    "fear_greed_regime": (
+                        classify_fear_greed(fg_val) if fg_val is not None else None
+                    ),
+                    "calendar_digest": calendar_digest(),
+                    "next_macro_event": asdict(next_ev) if next_ev else None,
+                    "upcoming_24h": [asdict(e) for e in upcoming_24h],
+                    "funding_pct": fund_pcts,
+                    "funding_rate_8h": fund_rates,
+                    "overlay": {
+                        "risk_scale": ov.risk_scale,
+                        "symbol_scales": ov.symbol_scales,
+                        "block_new_entries": ov.block_new_entries,
+                        "reasons": list(ov.reasons),
+                    },
+                    "feature_hash": feat_hash,
+                },
+                default=str,
+            )
+        )
+        return 0
+
+    console.print(_header(policy))
+    fg_str = (
+        f"{fg_val:.0f}/100 ({classify_fear_greed(fg_val)})"
+        if fg_val is not None
+        else "unavailable"
+    )
+    if next_ev is not None:
+        hours_away = (next_ev.ts_ms - now_ms) / 3_600_000.0
+        ev_str = f"{next_ev.kind} at {next_ev.iso_utc} (in {hours_away:.1f}h)"
+    else:
+        ev_str = "none scheduled"
+
+    console.print(
+        f"[bold]Tier-1 Risk Signals[/bold] · Fear & Greed [cyan]{fg_str}[/cyan] · "
+        f"next macro event [yellow]{ev_str}[/yellow] · calendar digest {calendar_digest()}"
+    )
+
+    table = Table(
+        title="Perpetual Funding Crowding (Trailing 1-Year Percentile)",
+        title_justify="left",
+        header_style="bold",
+    )
+    table.add_column("Instrument")
+    table.add_column("8h Rate", justify="right")
+    table.add_column("Annualized APR", justify="right")
+    table.add_column("1y Percentile", justify="right")
+    table.add_column("Overlay Scale", justify="right")
+    for sym in symbols:
+        r = fund_rates.get(sym)
+        pct = fund_pcts.get(sym)
+        sc = ov.scale_for(sym)
+        r_str = f"{r * 100:+.4f}%" if r is not None else "—"
+        apr_str = f"{r * 3 * 365 * 100:+.2f}%" if r is not None else "—"
+        pct_str = f"p{pct:.0f}" if pct is not None else "no history (<90 obs)"
+        sc_col = "yellow" if sc < 1.0 else "green"
+        table.add_row(sym, r_str, apr_str, pct_str, f"[{sc_col}]{sc:.2f}x[/{sc_col}]")
+    console.print(table)
+
+    gate_str = (
+        "[yellow]BLOCK NEW ENTRIES (24h macro window)[/yellow]"
+        if ov.block_new_entries
+        else "[green]OPEN[/green]"
+    )
+    reasons_str = "; ".join(ov.reasons) if ov.reasons else "none (full 1.00x dial)"
+    console.print(
+        f"  entry gate: {gate_str} · global scale: [bold]{ov.risk_scale:.2f}x[/bold] · "
+        f"reasons: {reasons_str}"
+    )
+    console.print(f"[dim]feature hash: {feat_hash[:16]}… (~/.vito/features.jsonl)[/dim]")
     return 0
 
 
@@ -1498,9 +1649,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=8.0,
         help="Simple Earn Flexible APR %% on unallocated USDT cash (default: 8.0)",
     )
+    panel.add_argument(
+        "--overlay",
+        action="store_true",
+        help="apply Tier-1 risk-reducing overlay (Fear & Greed, funding, FOMC/CPI calendar)",
+    )
     panel.add_argument("--refresh", action="store_true")
     panel.add_argument("--json", action="store_true")
     panel.set_defaults(func=cmd_panel)
+
+    signals = sub.add_parser(
+        "signals",
+        help="inspect live Tier-1 risk signals (Fear & Greed, funding crowding, FOMC/CPI calendar)",
+    )
+    signals.add_argument("--symbols", default=",".join(DEFAULT_BASKET))
+    signals.add_argument("--refresh", action="store_true")
+    signals.add_argument("--json", action="store_true")
+    signals.set_defaults(func=cmd_signals)
 
     shadow = sub.add_parser(
         "shadow",

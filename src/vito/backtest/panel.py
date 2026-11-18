@@ -31,7 +31,9 @@ Precious Metals):
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -202,6 +204,7 @@ def run_panel_momentum(
     slippage_bps: float = 2.0,
     cash_apr_pct: float = 0.0,
     min_notional: dict[str, float] | None = None,
+    overlay_fn: Callable[[int], Any] | None = None,
 ) -> PanelResult:
     """Run the pre-registered long-only cross-asset momentum portfolio."""
     ts, opens, _, lows, closes, stop_dists = align_panel(frames, atr_mult=atr_mult)
@@ -245,6 +248,9 @@ def run_panel_momentum(
     stops_hit = 0
     bars_invested = 0
     bars_since_rebalance = rebalance_every
+    overlay_blocked_entries = 0
+    overlay_scaled_allocs = 0
+    blocked_forward_rets: list[float] = []
     asset_pnl: dict[str, float] = dict.fromkeys(symbols, 0.0)
     asset_bars: dict[str, int] = dict.fromkeys(symbols, 0)
 
@@ -298,6 +304,8 @@ def run_panel_momentum(
                             equity += step_pnl
                             asset_pnl[sym] += step_pnl
 
+            ov = overlay_fn(int(ts[i])) if overlay_fn is not None else None
+            blocked_new_this_bar = False
             gross_cap_each = (
                 (equity * max_gross_exposure_mult) / max(1, len(pending_targets))
                 if pending_targets
@@ -306,9 +314,21 @@ def run_panel_momentum(
             desired_notional: dict[str, float] = {}
             desired_stop_dist: dict[str, float] = {}
             for sym, stop_d in pending_targets:
+                if ov is not None and ov.block_new_entries and sym not in holdings:
+                    overlay_blocked_entries += 1
+                    blocked_new_this_bar = True
+                    fwd_idx = min(n - 1, i + rebalance_every)
+                    op_now = opens[sym][i]
+                    op_fwd = opens[sym][fwd_idx]
+                    if math.isfinite(op_now) and math.isfinite(op_fwd) and op_now > 0:
+                        blocked_forward_rets.append((op_fwd / op_now - 1.0) * 100.0)
+                    continue
                 safe_stop = max(0.006, stop_d if math.isfinite(stop_d) and stop_d > 0 else 0.02)
                 risk_notional = (equity * risk_frac) / safe_stop if use_stops else gross_cap_each
-                alloc = min(gross_cap_each, risk_notional)
+                sym_scale = float(ov.scale_for(sym)) if ov is not None else 1.0
+                if sym_scale < 1.0:
+                    overlay_scaled_allocs += 1
+                alloc = min(gross_cap_each, risk_notional) * sym_scale
                 if alloc >= min_notional_map.get(sym, 0.0):
                     desired_notional[sym] = alloc
                     desired_stop_dist[sym] = safe_stop
@@ -343,7 +363,7 @@ def run_panel_momentum(
             total_turnover += turnover
             holdings = new_holdings
             stops = new_stops
-            bars_since_rebalance = 0
+            bars_since_rebalance = (rebalance_every - 1) if blocked_new_this_bar else 0
             avg_alloc = (
                 sum(desired_notional.values()) / len(desired_notional)
                 if desired_notional
@@ -448,6 +468,14 @@ def run_panel_momentum(
     metrics["exposure_pct"] = round(bars_invested / max(1, n - lookback) * 100, 1)
     metrics["stops_hit"] = float(stops_hit)
     metrics["cash_yield_usdt"] = round(total_cash_yield, 2)
+    if overlay_fn is not None:
+        metrics["overlay_blocked_entries"] = float(overlay_blocked_entries)
+        metrics["overlay_scaled_allocs"] = float(overlay_scaled_allocs)
+        metrics["overlay_blocked_avg_5d_ret_pct"] = (
+            round(float(sum(blocked_forward_rets) / len(blocked_forward_rets)), 2)
+            if blocked_forward_rets
+            else 0.0
+        )
 
     benchmark = _panel_metrics(
         ew_curve.iloc[lookback:],
