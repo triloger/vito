@@ -49,7 +49,12 @@ from vito.data.ohlcv import (
     fetch_recent,
 )
 from vito.exchange import ExchangeUnavailable, MissingCredentials, build_gateway
-from vito.exec import build_shadow_plan
+from vito.exec import (
+    ExecutionLocked,
+    OrderRouter,
+    build_execution_runbook,
+    build_shadow_plan,
+)
 from vito.network import EgressStatus, check_egress, fetch_egress_ip
 from vito.paper import PaperBroker, PaperPanelBroker, load_state
 from vito.policy import Policy, PolicyError, load_policy
@@ -1649,6 +1654,141 @@ def cmd_clock(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_execute(args: argparse.Namespace) -> int:
+    """Build (and optionally execute when armed) the 7-stage portfolio rebalance runbook."""
+    policy = load_policy(args.policy)
+    gateway = build_gateway(load_credentials())
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+
+    if gateway.has_credentials:
+        try:
+            snap = build_snapshot(gateway)
+            equity_usdt = snap.total_usdt
+            cash_usdt = snap.cash_usdt
+        except ExchangeUnavailable as exc:
+            console.print(f"[red]Account snapshot failed:[/red] {exc}")
+            return 2
+    else:
+        equity_usdt = float(args.equity)
+        cash_usdt = float(args.equity)
+
+    frames = {}
+    with console.status(
+        f"reconciling {len(symbols)} instruments ({args.timeframe}) against "
+        f"{_money(equity_usdt)} USDT…",
+        spinner="dots",
+    ):
+        for sym in symbols:
+            try:
+                raw = fetch_recent(gateway, sym, timeframe=args.timeframe, limit=args.bars)
+                closed = closed_only(raw, args.timeframe)
+                if not closed.empty:
+                    frames[sym] = closed
+            except ExchangeUnavailable:
+                continue
+
+        raw_mpg = getattr(args, "max_per_group", 1)
+        max_per_group = int(raw_mpg) if (raw_mpg is not None and int(raw_mpg) > 0) else None
+        index_gear = float(getattr(args, "index_gear", 1.0))
+        plan = build_shadow_plan(
+            policy=policy,
+            gateway=gateway,
+            frames=frames,
+            equity_usdt=equity_usdt,
+            cash_usdt=cash_usdt,
+            lookback=args.lookback,
+            max_positions=args.max_positions,
+            max_per_group=max_per_group,
+            max_exposure=args.max_exposure,
+            risk_per_trade_pct=args.risk_pct,
+            index_gear_mult=index_gear,
+            persist_audit=False,
+        )
+        runbook = build_execution_runbook(
+            policy=policy,
+            gateway=gateway,
+            plan=plan,
+            symbols=symbols,
+        )
+
+    exec_result = None
+    if getattr(args, "arm", None):
+        router = OrderRouter(policy)
+        try:
+            router.arm(str(args.arm))
+            exec_result = router.execute_runbook(runbook, gateway=gateway)
+        except ExecutionLocked as exc:
+            console.print(f"[red]Execution locked:[/red] {exc}")
+            return 1
+
+    if args.json:
+        payload = asdict(runbook)
+        payload["executed"] = exec_result
+        console.print_json(json.dumps(payload, default=str))
+        return 0
+
+    console.print(_header(policy))
+    mode_tag = (
+        "[bold green]LIVE ARMED EXECUTION[/bold green]"
+        if exec_result is not None
+        else "[yellow]DRY-RUN REHEARSAL (pass --arm <digest> to execute)[/yellow]"
+    )
+    console.print(
+        f"[bold]Execution Runbook[/bold] · {mode_tag} · "
+        f"equity [bold]{_money(plan.equity_usdt)}[/bold] USDT"
+    )
+    console.print(
+        f"  wallets · Spot Free: [bold]${runbook.spot_free_usdt:.2f}[/bold] · "
+        f"USDⓈ-M Futures Free: [bold]${runbook.future_free_usdt:.2f}[/bold] · "
+        f"Simple Earn ({runbook.earn_product_id}): "
+        f"[green]${runbook.earn_flexible_usdt:.2f}[/green] @ {plan.earn_apr_pct:.2f}% APR"
+    )
+
+    if runbook.blocked_reason:
+        console.print(f"  [red]BLOCKED: {runbook.blocked_reason}[/red]")
+    elif not runbook.steps:
+        console.print(
+            "  [green]ALIGNED: account wallets, Simple Earn, and positions match target "
+            "regime — 0 exchange operations needed[/green]"
+        )
+    else:
+        table = Table(
+            title="7-Stage Atomic Execution Sequence",
+            title_justify="left",
+            header_style="bold",
+        )
+        for col in ("Stage", "Action", "Instrument", "Route", "USDT", "Qty", "Stop", "Operation"):
+            align = "right" if col in ("Stage", "USDT", "Qty", "Stop") else "left"
+            table.add_column(col, justify=align)
+        for s in runbook.steps:
+            stop_str = f"{s.stop_price:,.2f}" if s.stop_price > 0 else "—"
+            usdt_str = f"${s.amount_usdt:,.2f}" if s.amount_usdt > 0 else "—"
+            qty_str = f"{s.qty:g}" if s.qty > 0 else "—"
+            table.add_row(
+                str(s.stage),
+                s.action,
+                s.inst_id,
+                s.wallet,
+                usdt_str,
+                qty_str,
+                stop_str,
+                s.detail,
+            )
+        console.print(table)
+
+    if exec_result is not None:
+        console.print(
+            f"  [bold green]executed {exec_result['steps_executed']} step(s)[/bold green] · "
+            f"live audit hash {exec_result['audit_hash'][:16]}…"
+        )
+    else:
+        log_path = policy.execution.audit_log
+        console.print(
+            f"[dim]runbook audit hash: {runbook.audit_hash[:16]}… ({log_path})[/dim]"
+        )
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # entry point
 # ---------------------------------------------------------------------------
@@ -1833,6 +1973,28 @@ def build_parser() -> argparse.ArgumentParser:
     shadow.add_argument("--equity", type=float, default=200.0)
     shadow.add_argument("--json", action="store_true")
     shadow.set_defaults(func=cmd_shadow)
+
+    execute = sub.add_parser(
+        "execute",
+        help="reconcile wallets, Simple Earn, positions, and stops into an atomic 7-stage runbook",
+    )
+    execute.add_argument("--symbols", default=",".join(DEFAULT_BASKET))
+    execute.add_argument("--timeframe", default="1d", choices=sorted(TIMEFRAME_MS))
+    execute.add_argument("--lookback", type=int, default=20)
+    execute.add_argument("--max-positions", type=int, default=2)
+    execute.add_argument("--max-per-group", type=int, default=1)
+    execute.add_argument("--risk-pct", type=float, default=4.0)
+    execute.add_argument("--max-exposure", type=float, default=2.50)
+    execute.add_argument("--index-gear", type=float, default=1.0)
+    execute.add_argument("--bars", type=int, default=250)
+    execute.add_argument("--equity", type=float, default=200.0)
+    execute.add_argument(
+        "--arm",
+        default=None,
+        help="16-char policy digest to arm and execute the runbook live (omit for dry-run)",
+    )
+    execute.add_argument("--json", action="store_true")
+    execute.set_defaults(func=cmd_execute)
 
     paper = sub.add_parser("paper", help="paper trading against live prices")
     paper_sub = paper.add_subparsers(dest="paper_command", required=True)

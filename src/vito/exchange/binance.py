@@ -217,6 +217,23 @@ class BinanceGateway:
         )
         return max(contract * min_amount * price, min_cost)
 
+    def round_order(
+        self, inst_id: str, qty: float, price: float
+    ) -> tuple[float, float]:
+        """Round ``(qty, price)`` to Binance's exact ``LOT_SIZE`` and ``PRICE_FILTER`` steps."""
+        market = self._market(inst_id)
+        cli = self._client_for(market)
+        sym = str(market["symbol"])
+        try:
+            q_val = float(cli.amount_to_precision(sym, qty)) if qty > 0 else 0.0
+        except Exception:  # noqa: BLE001
+            q_val = 0.0
+        try:
+            p_val = float(cli.price_to_precision(sym, price)) if price > 0 else 0.0
+        except Exception:  # noqa: BLE001
+            p_val = round(price, 6)
+        return q_val, p_val
+
     def swap_tickers(self) -> dict[str, dict[str, Any]]:
         """Fetch all linear swap tickers including bid/ask from bookTicker."""
         try:
@@ -355,6 +372,150 @@ class BinanceGateway:
         except Exception:  # noqa: BLE001
             pass
         return {"asset": asset.upper(), "amount": 0.0, "apr_pct": 0.0, "product_id": ""}
+
+    def wallet_usdt_breakdown(self) -> dict[str, Any]:
+        """Return free USDT in Spot, USDⓈ-M Futures, and Simple Earn Flexible separately."""
+        if not self.has_credentials:
+            return {
+                "spot_free": 0.0,
+                "future_free": 0.0,
+                "earn_flexible": 0.0,
+                "product_id": "USDT001",
+                "earn_apr_pct": 0.0,
+            }
+        spot_free = 0.0
+        future_free = 0.0
+        with contextlib.suppress(Exception):
+            raw_s = self._spot_client.fetch_balance({"type": "spot"})
+            spot_free = float((raw_s.get("free") or {}).get("USDT") or 0.0)
+        with contextlib.suppress(Exception):
+            raw_f = self._client.fetch_balance()
+            future_free = float((raw_f.get("free") or {}).get("USDT") or 0.0)
+        earn = self.earn_info("USDT")
+        return {
+            "spot_free": round(spot_free, 2),
+            "future_free": round(future_free, 2),
+            "earn_flexible": round(float(earn.get("amount") or 0.0), 2),
+            "product_id": str(earn.get("product_id") or "USDT001"),
+            "earn_apr_pct": float(earn.get("apr_pct") or 0.0),
+        }
+
+    def live_positions_and_stops(
+        self, symbols: tuple[str, ...] | list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Inspect live Spot/Futures positions and open protective stop orders."""
+        if not self.has_credentials:
+            return {}
+        out: dict[str, dict[str, Any]] = {}
+        # 1. Spot balances for watched symbols
+        spot_bals: dict[str, float] = {}
+        with contextlib.suppress(Exception):
+            raw_s = self._spot_client.fetch_balance({"type": "spot"})
+            for ccy, tot in (raw_s.get("total") or {}).items():
+                if not str(ccy).startswith("LD") and float(tot or 0.0) > 0:
+                    spot_bals[str(ccy).upper()] = float(tot)
+
+        # 2. Futures open positions
+        fut_pos: dict[str, float] = {}
+        with contextlib.suppress(Exception):
+            for p in self._client.fetch_positions():
+                contracts = float(p.get("contracts") or 0.0)
+                if abs(contracts) <= 0:
+                    continue
+                side = str(p.get("side") or "long").lower()
+                signed = contracts if side != "short" else -contracts
+                sym_raw = str(p.get("symbol") or "")
+                m = self._by_inst_id.get(sym_raw)
+                if m is not None:
+                    fut_pos[canonical_inst_id(m)] = signed
+
+        all_watch = set(symbols)
+        for s in list(symbols):
+            if not s.endswith("-SWAP") and not s.startswith("BTC-"):
+                all_watch.add(f"{s}-SWAP")
+
+        for inst_id in sorted(all_watch):
+            try:
+                m = self._market(inst_id)
+            except ExchangeUnavailable:
+                continue
+            wallet = "future" if m.get("type") == "swap" else "spot"
+            base = str(m.get("base") or "").upper()
+            qty = fut_pos.get(inst_id, 0.0) if wallet == "future" else spot_bals.get(base, 0.0)
+            if abs(qty) <= 1e-8:
+                continue
+            ref_px = self.spot_price(base) or 0.0
+            notional = abs(qty) * ref_px
+            if notional < 2.0:  # ignore dust (< $2)
+                continue
+            stop_price = 0.0
+            stop_order_id = ""
+            cli = self._client_for(m)
+            with contextlib.suppress(Exception):
+                for o in cli.fetch_open_orders(m["symbol"]):
+                    otype = str(o.get("type") or "").upper()
+                    if "STOP" in otype:
+                        sp = float(
+                            o.get("stopPrice")
+                            or (o.get("info") or {}).get("stopPrice")
+                            or 0.0
+                        )
+                        if sp > stop_price:
+                            stop_price = sp
+                            stop_order_id = str(o.get("id") or "")
+            out[inst_id] = {
+                "inst_id": inst_id,
+                "wallet": wallet,
+                "qty": qty,
+                "notional_usdt": round(notional, 2),
+                "stop_price": stop_price,
+                "stop_order_id": stop_order_id,
+            }
+        return out
+
+    def redeem_earn(
+        self,
+        amount_usdt: float,
+        *,
+        product_id: str = "USDT001",
+        dest_account: str = "SPOT",
+    ) -> dict[str, Any]:
+        """Redeem ``amount_usdt`` from Simple Earn Flexible to ``SPOT``."""
+        return dict(
+            self._spot_client.sapiPostSimpleEarnFlexibleRedeem(
+                {
+                    "productId": product_id,
+                    "amount": f"{amount_usdt:.2f}",
+                    "destAccount": dest_account,
+                }
+            )
+            or {}
+        )
+
+    def subscribe_earn(
+        self, amount_usdt: float, *, product_id: str = "USDT001"
+    ) -> dict[str, Any]:
+        """Subscribe idle Spot USDT into Simple Earn Flexible."""
+        return dict(
+            self._spot_client.sapiPostSimpleEarnFlexibleSubscribe(
+                {
+                    "productId": product_id,
+                    "amount": f"{amount_usdt:.2f}",
+                }
+            )
+            or {}
+        )
+
+    def transfer_usdt(
+        self, amount_usdt: float, *, from_wallet: str, to_wallet: str
+    ) -> dict[str, Any]:
+        """Transfer USDT between ``spot`` and ``future`` wallets."""
+        return dict(
+            self._spot_client.transfer(
+                "USDT", round(amount_usdt, 2), from_wallet, to_wallet
+            )
+            or {}
+        )
 
     # -- lifecycle ---------------------------------------------------------
 
