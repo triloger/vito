@@ -491,7 +491,8 @@ class PaperPanelBroker:
         lookback: int = 20,
         rebalance_every: int = 5,
         max_positions: int = 2,
-        max_exposure: float = 0.75,
+        max_exposure: float = 1.50,
+        risk_per_trade_pct: float = 3.0,
         initial_equity: float = 200.0,
         fee_bps: float = 5.0,
         slippage_bps: float = 2.0,
@@ -504,6 +505,7 @@ class PaperPanelBroker:
         self.rebalance_every = rebalance_every
         self.max_positions = max_positions
         self.max_exposure = max_exposure
+        self.risk_per_trade_pct = risk_per_trade_pct
         self.initial_equity = float(initial_equity)
         self.fee_bps = fee_bps
         self.slippage_bps = slippage_bps
@@ -524,6 +526,7 @@ class PaperPanelBroker:
                 "rebalance_every": self.rebalance_every,
                 "max_positions": self.max_positions,
                 "max_exposure": self.max_exposure,
+                "risk_per_trade_pct": self.risk_per_trade_pct,
                 "bars_since_rebalance": self.rebalance_every,
             },
             initial_equity=self.initial_equity,
@@ -573,7 +576,7 @@ class PaperPanelBroker:
         cost_rate = (self.fee_bps + self.slippage_bps) / 10_000.0
         fee_rate = self.fee_bps / 10_000.0
         slip_rate = self.slippage_bps / 10_000.0
-        risk_frac = self.policy.risk.risk_per_trade_pct / 100.0
+        risk_frac = self.risk_per_trade_pct / 100.0
 
         actions: list[str] = []
         holdings: dict[str, dict[str, float]] = (

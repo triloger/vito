@@ -66,7 +66,8 @@ def build_shadow_plan(
     cash_usdt: float,
     lookback: int = 20,
     max_positions: int = 2,
-    max_exposure: float = 0.75,
+    max_exposure: float = 1.50,
+    risk_per_trade_pct: float = 3.0,
     persist_audit: bool = True,
 ) -> ShadowPlan:
     """Evaluate the live account and market state, build the target portfolio, and log to audit."""
@@ -90,26 +91,37 @@ def build_shadow_plan(
     gross_cap_each = (
         (equity_usdt * max_exposure) / max(1, len(ranked)) if ranked else 0.0
     )
-    risk_frac = policy.risk.risk_per_trade_pct / 100.0
+    risk_frac = risk_per_trade_pct / 100.0
+    max_spot_cash = equity_usdt * 0.75
 
     orders: list[ShadowOrder] = []
     deployed = 0.0
+    spot_used = 0.0
     for sym, score, last_close, stop_d in ranked:
         safe_stop = max(policy.risk.min_stop_distance_pct / 100.0, stop_d)
         risk_notional = (equity_usdt * risk_frac) / safe_stop
         alloc = round(min(gross_cap_each, risk_notional), 2)
+        exec_sym = sym
+        wallet = "future" if sym.endswith("-SWAP") else "spot"
+        # If adding another Spot position would exceed 75% of account cash when
+        # total portfolio target > 1.0x, route non-BTC Spot legs to their -SWAP
+        # perpetual on USDⓈ-M Futures so 1.50x gross exposure is physically funded.
+        if wallet == "spot" and (spot_used + alloc > max_spot_cash) and not sym.startswith("BTC-"):
+            exec_sym = f"{sym}-SWAP"
+            wallet = "future"
         try:
-            min_not = round(float(gateway.min_notional(sym)), 2)
+            min_not = round(float(gateway.min_notional(exec_sym)), 2)
         except Exception:  # noqa: BLE001
             min_not = 5.0
-        wallet = "future" if sym.endswith("-SWAP") else "spot"
         ok = alloc >= min_not and last_close > 0
         reason = "" if ok else f"alloc ${alloc:.2f} < min_notional ${min_not:.2f}"
         if ok:
             deployed += alloc
+            if wallet == "spot":
+                spot_used += alloc
         orders.append(
             ShadowOrder(
-                inst_id=sym,
+                inst_id=exec_sym,
                 wallet=wallet,
                 score=score,
                 ref_price=round(last_close, 6),
@@ -123,7 +135,7 @@ def build_shadow_plan(
             )
         )
 
-    idle_cash = round(max(0.0, equity_usdt - deployed), 2)
+    idle_cash = round(max(0.0, equity_usdt - spot_used), 2)
     daily_earn = round(idle_cash * (earn_apr / 100.0) / 365.0, 4)
 
     audit_hash = ""
