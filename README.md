@@ -131,6 +131,7 @@ It prompts for your API Key and Secret with hidden input (`getpass`), saves `.en
 ```bash
 .venv/bin/vito status        # Live market prices, funding APRs, your total USDT (incl. Simple Earn), and active guards
 .venv/bin/vito shadow        # Live Shadow Execution Plan: regime, Simple Earn APR, intended orders, native STOP_MARKET, and 3x Index Gear radar
+.venv/bin/vito execute       # 7-Stage Atomic Reconciler (dry-run by default; pass --arm <digest> to execute live)
 .venv/bin/vito clock         # US equity cash session state, 21:15 UTC TradFi timer, 8h funding countdown, and liquidity windows
 .venv/bin/vito signals       # Live Fear & Greed, FOMC/CPI calendar, and trailing 1y funding percentiles
 .venv/bin/vito paper panel   # Step the live paper portfolio forward on newly closed daily candles
@@ -146,10 +147,11 @@ It prompts for your API Key and Secret with hidden input (`getpass`), saves `.en
 Loaded from [`config/policy.toml`](config/policy.toml) and enforced in code:
 
 1. **Hard Equity Floor (`$50.00 USDT`):** If account equity ever drops below `$50.00`, Vito refuses to open new positions.
-2. **Intrabar Trailing ATR Stops:** Every position has a `2.5 × ATR_14` stop that ratchets up as price rises and never moves down.
-3. **Emergency Kill Switch:** Run `touch ~/.vito/HALT` at any time and every paper, shadow, and live router halts immediately.
-4. **Tamper-Evident Audit Chain (`~/.vito/audit.jsonl`):** Every shadow plan, order, and refusal is SHA-256 hash-chained to the previous entry.
-5. **Four-Key Execution Lock:** Live order routing (`OrderRouter.arm`) is physically locked unless `execution.mode = "live"`, `VITO_LIVE=1` is set, the exact 16-character policy digest is confirmed, and no `HALT` file exists.
+2. **Exchange-Native Trailing ATR Stops:** Every position places a real `2.5 × ATR_14` protective stop on Binance (`STOP_MARKET reduceOnly` on Futures, `STOP_LOSS_LIMIT GTC` on Spot) that ratchets up as price rises and never moves down.
+3. **Portfolio Circuit Breakers (`~/.vito/live_state.json`):** Enforces the `18.0%` peak-drawdown stop (flattens to Simple Earn and latches until `--reset-halt`), `4.5%` rolling 24h loss halt, and `4`-loss streak `24h` cooldown.
+4. **Emergency Kill Switch:** Run `touch ~/.vito/HALT` at any time and every paper, shadow, and live router halts immediately.
+5. **Tamper-Evident Audit Chain (`~/.vito/audit.jsonl`):** Every shadow plan, runbook, order, and refusal is SHA-256 hash-chained to the previous entry.
+6. **Four-Key Execution Lock:** Live order routing (`OrderRouter.arm`) is physically locked unless `execution.mode = "live"`, `VITO_LIVE=1` is set, the exact 16-character policy digest is confirmed, and no `HALT` file exists.
 
 ---
 
@@ -165,11 +167,11 @@ src/vito/
   strategy/          indicators (ATR, EMA, RSI, Donchian) & single-series strategies
   backtest/          single-asset engine, walk-forward validator, and cross-asset momentum panel
   paper/             step-driven single-asset & cross-asset paper brokers
-  exec/              shadow planner, locked OrderRouter, and hash-chained AuditLog
-  cli.py             status | setup | doctor | net | policy | instruments | backtest | walkforward | panel | shadow | paper
+  exec/              7-stage execution reconciler, live risk tracker, shadow planner, and hash-chained AuditLog
+  cli.py             status | setup | doctor | net | policy | instruments | backtest | walkforward | panel | shadow | execute | clock | paper
 docs/                binance-setup, okx-setup, architecture, risk-policy, paper, research journal
 config/              policy.toml, config.example.toml
-tests/               136 unit tests, zero network calls required
+tests/               150 unit tests, zero network calls required
 ```
 
 ## License
