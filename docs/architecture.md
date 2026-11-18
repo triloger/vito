@@ -7,8 +7,8 @@ third category, and nothing is allowed to grow into one by accident.
 
 ```
                  ┌──────────────────────────────────────────┐
-   public data   │  exchange/okx.py                         │
-  ──────────────▶│  one ccxt wrapper, credential-aware      │
+   public data   │  exchange/binance.py (+ okx.py)          │
+  ──────────────▶│  ccxt gateway, Spot + Futures + Earn     │
                  └───────────────┬──────────────────────────┘
                                  │
         ┌────────────────────────┼─────────────────────────┐

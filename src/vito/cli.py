@@ -1010,7 +1010,7 @@ def cmd_instruments(args: argparse.Namespace) -> int:
     policy = load_policy(args.policy)
     gateway = build_gateway(load_credentials())
 
-    with console.status("scanning OKX instruments…", spinner="dots"):
+    with console.status("scanning exchange instruments…", spinner="dots"):
         specs = scan_instruments(
             gateway,
             kind=args.kind,
@@ -1340,7 +1340,7 @@ def cmd_shadow(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vito",
-        description="Personal quantitative treasury for OKX. Read-only by default.",
+        description="Personal quantitative treasury for Binance (and OKX). Read-only by default.",
     )
     parser.add_argument("--version", action="version", version=f"vito {__version__}")
     parser.add_argument(
@@ -1374,7 +1374,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     inst = sub.add_parser(
         "instruments",
-        help="scan OKX markets for contract specs, liquidity, and $200 tradeability",
+        help="scan exchange markets for contract specs, liquidity, and small-account tradeability",
     )
     inst.add_argument("--kind", default="all", choices=["all", "swap", "spot"])
     inst.add_argument(

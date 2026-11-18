@@ -1,4 +1,4 @@
-"""Vito — a personal quantitative treasury system for OKX.
+"""Vito — a personal quantitative treasury system for Binance (and OKX).
 
 Three layers, deliberately separated:
 
