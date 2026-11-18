@@ -235,7 +235,7 @@ class BinanceGateway:
     # -- private: read-only -------------------------------------------------
 
     def balances(self) -> dict[str, BalanceEntry]:
-        """Read non-zero balances across USDⓈ-M Futures and Spot wallets."""
+        """Read non-zero balances across Futures, Spot, Funding, and Simple Earn."""
         if not self.has_credentials:
             raise MissingCredentials(
                 "account access needs VITO_BINANCE_API_KEY and VITO_BINANCE_API_SECRET"
@@ -243,29 +243,58 @@ class BinanceGateway:
         entries: dict[str, BalanceEntry] = {}
         errors: list[str] = []
 
-        for cli in (self._client, self._spot_client):
+        def _add(currency: str, free_f: float, used_f: float, total_f: float) -> None:
+            if total_f <= 1e-7 and free_f <= 1e-7 and used_f <= 1e-7:
+                return
+            prev = entries.get(currency)
+            if prev is None:
+                entries[currency] = BalanceEntry(currency, free_f, used_f, total_f)
+            else:
+                entries[currency] = BalanceEntry(
+                    currency,
+                    prev.free + free_f,
+                    prev.used + used_f,
+                    prev.total + total_f,
+                )
+
+        for cli, params in (
+            (self._client, {}),
+            (self._spot_client, {"type": "spot"}),
+            (self._spot_client, {"type": "funding"}),
+        ):
             try:
-                raw = cli.fetch_balance()
+                raw = cli.fetch_balance(params)
             except ccxt.BaseError as exc:  # pragma: no cover - network
                 errors.append(str(exc))
                 continue
             for currency, total in (raw.get("total") or {}).items():
+                # Skip Binance internal Simple Earn share tokens (LD*); real amounts
+                # are fetched below from /sapi/v1/simple-earn/flexible/position.
+                if str(currency).startswith("LD") and len(str(currency)) > 2:
+                    continue
                 total_f = float(total or 0)
                 free_f = float((raw.get("free") or {}).get(currency) or 0)
                 used_f = float((raw.get("used") or {}).get(currency) or 0)
-                if total_f or free_f or used_f:
-                    prev = entries.get(currency)
-                    if prev is None:
-                        entries[currency] = BalanceEntry(currency, free_f, used_f, total_f)
-                    else:
-                        entries[currency] = BalanceEntry(
-                            currency,
-                            prev.free + free_f,
-                            prev.used + used_f,
-                            prev.total + total_f,
-                        )
+                _add(str(currency), free_f, used_f, total_f)
 
-        if not entries and len(errors) == 2:
+        # Include Simple Earn Flexible & Locked balances at their true underlying value
+        with contextlib.suppress(Exception):
+            flex = self._spot_client.sapiGetSimpleEarnFlexiblePosition()
+            for row in (flex or {}).get("rows") or []:
+                ccy = str(row.get("asset") or "")
+                amt = float(row.get("totalAmount") or 0.0)
+                if ccy and amt > 0:
+                    _add(ccy, amt, 0.0, amt)
+
+        with contextlib.suppress(Exception):
+            locked = self._spot_client.sapiGetSimpleEarnLockedPosition()
+            for row in (locked or {}).get("rows") or []:
+                ccy = str(row.get("asset") or "")
+                amt = float(row.get("amount") or 0.0)
+                if ccy and amt > 0:
+                    _add(ccy, 0.0, amt, amt)
+
+        if not entries and len(errors) >= 2:
             raise ExchangeUnavailable(errors[0])
         return entries
 
