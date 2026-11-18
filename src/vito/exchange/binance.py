@@ -311,6 +311,33 @@ class BinanceGateway:
                 continue
         return None
 
+    def earn_info(self, asset: str = "USDT") -> dict[str, Any]:
+        """Return Simple Earn Flexible position and effective APR for ``asset``."""
+        if not self.has_credentials:
+            return {"asset": asset, "amount": 0.0, "apr_pct": 0.0, "product_id": ""}
+        try:
+            flex = self._spot_client.sapiGetSimpleEarnFlexiblePosition({"asset": asset})
+            for row in (flex or {}).get("rows") or []:
+                if str(row.get("asset") or "").upper() != asset.upper():
+                    continue
+                amt = float(row.get("totalAmount") or 0.0)
+                base_apr = float(row.get("latestAnnualPercentageRate") or 0.0)
+                tier_map = row.get("tierAnnualPercentageRate") or {}
+                tier_apr = max((float(v) for v in tier_map.values()), default=0.0)
+                return {
+                    "asset": asset.upper(),
+                    "product_id": str(row.get("productId") or f"{asset.upper()}001"),
+                    "amount": round(amt, 6),
+                    "base_apr_pct": round(base_apr * 100.0, 2),
+                    "tier_apr_pct": round(tier_apr * 100.0, 2),
+                    "apr_pct": round((base_apr + tier_apr) * 100.0, 2),
+                    "can_redeem": bool(row.get("canRedeem", True)),
+                    "auto_subscribe": bool(row.get("autoSubscribe", False)),
+                }
+        except Exception:  # noqa: BLE001
+            pass
+        return {"asset": asset.upper(), "amount": 0.0, "apr_pct": 0.0, "product_id": ""}
+
     # -- lifecycle ---------------------------------------------------------
 
     def ping(self) -> bool:

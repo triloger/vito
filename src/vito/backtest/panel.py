@@ -39,12 +39,12 @@ import pandas as pd
 from vito.strategy.indicators import atr
 
 DEFAULT_BASKET: tuple[str, ...] = (
-    "BTC-USDT-SWAP",
-    "ETH-USDT-SWAP",
-    "SOL-USDT-SWAP",
+    "BTC-USDT",
+    "ETH-USDT",
+    "SOL-USDT",
+    "PAXG-USDT",
     "QQQ-USDT-SWAP",
     "SPY-USDT-SWAP",
-    "XAU-USDT-SWAP",
     "XAG-USDT-SWAP",
 )
 
@@ -200,6 +200,7 @@ def run_panel_momentum(
     initial_equity: float = 200.0,
     fee_bps: float = 5.0,
     slippage_bps: float = 2.0,
+    cash_apr_pct: float = 0.0,
     min_notional: dict[str, float] | None = None,
 ) -> PanelResult:
     """Run the pre-registered long-only cross-asset momentum portfolio."""
@@ -213,6 +214,8 @@ def run_panel_momentum(
     slip_rate = slippage_bps / 10_000.0
     fee_rate = fee_bps / 10_000.0
     risk_frac = risk_per_trade_pct / 100.0
+    per_year = BARS_PER_YEAR.get(timeframe, 365)
+    cash_bar_rate = (cash_apr_pct / 100.0) / per_year if cash_apr_pct > 0 else 0.0
     min_notional_map = min_notional or {}
 
     # Pre-compute strictly backward-looking momentum score at bar i close
@@ -238,6 +241,7 @@ def run_panel_momentum(
     rebalances: list[RebalanceRecord] = []
     total_fees = 0.0
     total_turnover = 0.0
+    total_cash_yield = 0.0
     stops_hit = 0
     bars_invested = 0
     asset_pnl: dict[str, float] = dict.fromkeys(symbols, 0.0)
@@ -382,6 +386,16 @@ def run_panel_momentum(
 
         if holdings:
             bars_invested += 1
+        if i >= lookback and cash_bar_rate > 0:
+            deployed = sum(
+                qty * closes[sym][i]
+                for sym, qty in holdings.items()
+                if math.isfinite(closes[sym][i]) and closes[sym][i] > 0
+            )
+            idle_cash = max(0.0, equity - deployed)
+            cy = idle_cash * cash_bar_rate
+            equity += cy
+            total_cash_yield += cy
         curve[i] = equity
 
         # 2. At close of bar i, decide if next open is a rebalance
@@ -423,6 +437,7 @@ def run_panel_momentum(
     metrics["turnover_usdt"] = round(total_turnover, 2)
     metrics["exposure_pct"] = round(bars_invested / max(1, n - lookback) * 100, 1)
     metrics["stops_hit"] = float(stops_hit)
+    metrics["cash_yield_usdt"] = round(total_cash_yield, 2)
 
     benchmark = _panel_metrics(
         ew_curve.iloc[lookback:],

@@ -48,6 +48,7 @@ from vito.data.ohlcv import (
     fetch_recent,
 )
 from vito.exchange import ExchangeUnavailable, MissingCredentials, build_gateway
+from vito.exec import build_shadow_plan
 from vito.network import EgressStatus, check_egress, fetch_egress_ip
 from vito.paper import PaperBroker, PaperPanelBroker, load_state
 from vito.policy import Policy, PolicyError, load_policy
@@ -1142,6 +1143,7 @@ def cmd_panel(args: argparse.Namespace) -> int:
             max_gross_exposure_mult=args.max_exposure,
             initial_equity=args.initial,
             fee_bps=args.fee_bps,
+            cash_apr_pct=args.cash_apr,
             min_notional=min_notional,
         )
     except ValueError as exc:
@@ -1199,18 +1201,130 @@ def cmd_panel(args: argparse.Namespace) -> int:
 
     m = result.metrics
     b = result.benchmark
+    cy_note = (
+        f" · earn +{m['cash_yield_usdt']:.2f} USDT"
+        if m.get("cash_yield_usdt", 0.0) > 0
+        else ""
+    )
     console.print(
         f"portfolio · return [bold]{m['total_return_pct']:+.2f}%[/bold] "
         f"(CAGR {m['cagr_pct']:+.2f}%) · max DD [red]{m['max_drawdown_pct']:.1f}%[/red] · "
         f"sharpe {m['sharpe']:.2f} (t={m['t_stat']:+.2f}) · "
         f"stops {int(m.get('stops_hit', 0))} · "
-        f"exposure {m['exposure_pct']:.1f}% · fees {m['fees_paid']:.2f} USDT"
+        f"exposure {m['exposure_pct']:.1f}% · fees {m['fees_paid']:.2f} USDT{cy_note}"
     )
     console.print(
         f"[dim]equal-weight basket buy & hold · return {b['total_return_pct']:+.2f}% "
         f"(CAGR {b['cagr_pct']:+.2f}%) · max DD {b['max_drawdown_pct']:.1f}% · "
         f"sharpe {b['sharpe']:.2f} (t={b['t_stat']:+.2f})[/dim]"
     )
+    return 0
+
+
+def cmd_shadow(args: argparse.Namespace) -> int:
+    """Evaluate live account equity + Simple Earn yield + panel signal and log to audit."""
+    policy = load_policy(args.policy)
+    gateway = build_gateway(load_credentials())
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+
+    if gateway.has_credentials:
+        try:
+            snap = build_snapshot(gateway)
+            equity_usdt = snap.total_usdt
+            cash_usdt = snap.cash_usdt
+        except ExchangeUnavailable as exc:
+            console.print(f"[red]Account snapshot failed:[/red] {exc}")
+            return 2
+    else:
+        equity_usdt = float(args.equity)
+        cash_usdt = float(args.equity)
+
+    frames = {}
+    with console.status(
+        f"evaluating {len(symbols)} instruments ({args.timeframe}) against "
+        f"{_money(equity_usdt)} USDT…",
+        spinner="dots",
+    ):
+        for sym in symbols:
+            try:
+                raw = fetch_recent(gateway, sym, timeframe=args.timeframe, limit=args.bars)
+                closed = closed_only(raw, args.timeframe)
+                if not closed.empty:
+                    frames[sym] = closed
+            except ExchangeUnavailable:
+                continue
+
+    plan = build_shadow_plan(
+        policy=policy,
+        gateway=gateway,
+        frames=frames,
+        equity_usdt=equity_usdt,
+        cash_usdt=cash_usdt,
+        lookback=args.lookback,
+        max_positions=args.max_positions,
+        max_exposure=args.max_exposure,
+    )
+
+    if args.json:
+        console.print_json(json.dumps(asdict(plan), default=str))
+        return 0
+
+    console.print(_header(policy))
+    console.print(
+        f"[bold]Shadow Execution Plan[/bold] · "
+        f"live equity [bold]{_money(plan.equity_usdt)}[/bold] USDT · "
+        f"Simple Earn [green]{plan.earn_apr_pct:.2f}% APR[/green] "
+        f"(+{plan.daily_earn_usdt:.4f} USDT/day)"
+    )
+
+    if plan.below_floor:
+        console.print(
+            f"[red]HALTED: equity {_money(plan.equity_usdt)} USDT is below "
+            f"policy floor {_money(policy.equity_floor_usdt)} USDT[/red]"
+        )
+    elif plan.halted:
+        console.print("[red]HALTED: kill switch is engaged[/red]")
+    elif not plan.orders:
+        console.print(
+            f"  [cyan]regime: CASH (no asset in uptrend) → keep 100% "
+            f"({_money(plan.idle_cash_usdt)} USDT) in Simple Earn Flexible "
+            f"@ {plan.earn_apr_pct:.2f}% APR[/cyan]"
+        )
+    else:
+        table = Table(title="Intended Orders", title_justify="left", header_style="bold")
+        cols = (
+            "Instrument",
+            "Wallet",
+            "Score",
+            "Price",
+            "Stop",
+            "Target USDT",
+            "Min USDT",
+            "Status",
+        )
+        for col in cols:
+            align = "left" if col in ("Instrument", "Wallet", "Status") else "right"
+            table.add_column(col, justify=align)
+        for o in plan.orders:
+            status_str = "[green]READY[/green]" if o.executable else f"[yellow]{o.reason}[/yellow]"
+            table.add_row(
+                o.inst_id,
+                o.wallet,
+                f"{o.score:+.2f}",
+                f"{o.ref_price:,.2f}",
+                f"{o.stop_price:,.2f} (-{o.stop_distance_pct:.1f}%)",
+                _money(o.target_notional_usdt),
+                _money(o.min_notional_usdt),
+                status_str,
+            )
+        console.print(table)
+        console.print(
+            f"  deployed {_money(plan.deployed_usdt)} USDT · "
+            f"idle in Simple Earn {_money(plan.idle_cash_usdt)} USDT "
+            f"(+{plan.daily_earn_usdt:.4f} USDT/day)"
+        )
+
+    console.print(f"[dim]audit hash: {plan.audit_hash[:16]}… ({policy.execution.audit_log})[/dim]")
     return 0
 
 
@@ -1337,9 +1451,29 @@ def build_parser() -> argparse.ArgumentParser:
     panel.add_argument("--max-exposure", type=float, default=0.75)
     panel.add_argument("--initial", type=float, default=200.0)
     panel.add_argument("--fee-bps", type=float, default=5.0)
+    panel.add_argument(
+        "--cash-apr",
+        type=float,
+        default=8.0,
+        help="Simple Earn Flexible APR %% on unallocated USDT cash (default: 8.0)",
+    )
     panel.add_argument("--refresh", action="store_true")
     panel.add_argument("--json", action="store_true")
     panel.set_defaults(func=cmd_panel)
+
+    shadow = sub.add_parser(
+        "shadow",
+        help="evaluate live equity, Simple Earn yield, and intended orders into the audit chain",
+    )
+    shadow.add_argument("--symbols", default=",".join(DEFAULT_BASKET))
+    shadow.add_argument("--timeframe", default="1d", choices=sorted(TIMEFRAME_MS))
+    shadow.add_argument("--lookback", type=int, default=20)
+    shadow.add_argument("--max-positions", type=int, default=2)
+    shadow.add_argument("--max-exposure", type=float, default=0.75)
+    shadow.add_argument("--bars", type=int, default=100)
+    shadow.add_argument("--equity", type=float, default=200.0)
+    shadow.add_argument("--json", action="store_true")
+    shadow.set_defaults(func=cmd_shadow)
 
     paper = sub.add_parser("paper", help="paper trading against live prices")
     paper_sub = paper.add_subparsers(dest="paper_command", required=True)
