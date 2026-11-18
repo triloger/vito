@@ -45,7 +45,7 @@ import pandas as pd
 
 from vito.backtest.engine import Trade
 from vito.policy import Policy
-from vito.risk import SizeRequest, kill_switch_engaged, size_position
+from vito.risk import SizeRequest, drawdown_halt, kill_switch_engaged, size_position
 from vito.strategy import build
 
 STATE_VERSION = 1
@@ -594,7 +594,9 @@ class PaperPanelBroker:
             i = int(idx)
             # 1. Rebalance at bar i open if scheduled
             pending = state.params.get("pending_targets")
-            if pending is not None and not halted:
+            dd_halted = drawdown_halt(state.peak_equity, state.equity, self.policy)
+            below_floor = state.equity < self.policy.equity_floor_usdt
+            if pending is not None and not (halted or dd_halted or below_floor):
                 if i > 0:
                     for sym, h in list(holdings.items()):
                         o_px = float(opens[sym][i])

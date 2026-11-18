@@ -12,19 +12,27 @@ Every live or shadow decision passes through the same policy checks:
 
 from __future__ import annotations
 
+import contextlib
+import json
+import math
 import os
+import tempfile
+import time
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
 from vito.backtest.panel import (
     IndexGearState,
+    align_panel,
     evaluate_index_gear_at,
     rank_panel_at,
 )
 from vito.exec.audit import AuditLog
 from vito.policy import Policy
+from vito.risk.limits import daily_loss_halt, drawdown_halt, streak_cooldown
 
 
 class ExecutionLocked(RuntimeError):
@@ -102,6 +110,9 @@ class ShadowPlan:
     idle_cash_usdt: float
     audit_hash: str
     index_gear: tuple[IndexGearState, ...] = ()
+    latest_bar_ts: int = 0
+    uptrend_symbols: tuple[str, ...] = ()
+    symbol_stops: dict[str, tuple[float, float, float]] = field(default_factory=dict)
 
 
 def build_shadow_plan(
@@ -131,6 +142,58 @@ def build_shadow_plan(
     )
     earn_amt = float(earn.get("amount") or 0.0)
     earn_apr = float(earn.get("apr_pct") or 0.0)
+
+    latest_bar_ts = 0
+    uptrend_symbols: tuple[str, ...] = ()
+    symbol_stops: dict[str, tuple[float, float, float]] = {}
+    if frames:
+        with contextlib.suppress(Exception):
+            ts_arr, _, _, _, closes_map, stop_dists_map = align_panel(frames)
+            if len(ts_arr) > 0:
+                latest_bar_ts = int(ts_arr[-1])
+            min_stop_frac = policy.risk.min_stop_distance_pct / 100.0
+            for sym_k, c_arr in closes_map.items():
+                if len(c_arr) == 0:
+                    continue
+                c_last = float(c_arr[-1])
+                if not math.isfinite(c_last) or c_last <= 0:
+                    continue
+                sd_raw = float(stop_dists_map[sym_k][-1])
+                safe_sd = max(
+                    min_stop_frac,
+                    sd_raw if (math.isfinite(sd_raw) and sd_raw > 0) else 0.02,
+                )
+                raw_sp = c_last * (1.0 - safe_sd)
+                if hasattr(gateway, "round_order"):
+                    _, sp_val = gateway.round_order(sym_k, 0.0, raw_sp)
+                else:
+                    sp_val = round(raw_sp, 6)
+                entry_tuple = (round(c_last, 6), round(safe_sd * 100.0, 2), sp_val)
+                symbol_stops[sym_k] = entry_tuple
+                if not sym_k.endswith("-SWAP") and not sym_k.startswith("BTC-"):
+                    swap_k = f"{sym_k}-SWAP"
+                    if hasattr(gateway, "round_order"):
+                        with contextlib.suppress(Exception):
+                            _, sp_swap = gateway.round_order(swap_k, 0.0, raw_sp)
+                            symbol_stops[swap_k] = (
+                                round(c_last, 6),
+                                round(safe_sd * 100.0, 2),
+                                sp_swap,
+                            )
+                    symbol_stops.setdefault(swap_k, entry_tuple)
+
+            all_up = rank_panel_at(
+                frames,
+                lookback=lookback,
+                max_positions=max(1, len(frames)),
+                max_per_group=None,
+            )
+            up_set: list[str] = []
+            for sym_u, _, _, _ in all_up:
+                up_set.append(sym_u)
+                if not sym_u.endswith("-SWAP") and not sym_u.startswith("BTC-"):
+                    up_set.append(f"{sym_u}-SWAP")
+            uptrend_symbols = tuple(up_set)
 
     ranked = (
         []
@@ -260,7 +323,249 @@ def build_shadow_plan(
         idle_cash_usdt=idle_cash,
         audit_hash=audit_hash,
         index_gear=gear_states,
+        latest_bar_ts=latest_bar_ts,
+        uptrend_symbols=uptrend_symbols,
+        symbol_stops=symbol_stops,
     )
+
+
+LIVE_STATE_VERSION = 1
+
+
+@dataclass(slots=True)
+class LiveRiskState:
+    """Persistent portfolio-level circuit-breaker and rebalance-cadence state."""
+
+    version: int = LIVE_STATE_VERSION
+    peak_equity_usdt: float = 0.0
+    drawdown_pct: float = 0.0
+    drawdown_halted: bool = False
+    equity_24h_ago_usdt: float = 0.0
+    pnl_24h_usdt: float = 0.0
+    daily_loss_pct: float = 0.0
+    daily_loss_halted: bool = False
+    consecutive_losses: int = 0
+    last_loss_ts_ms: int = 0
+    cooldown_until_ms: int = 0
+    streak_cooldown_active: bool = False
+    last_rebalance_bar_ts: int = 0
+    bars_since_rebalance: int = 0
+    rebalance_due: bool = True
+    equity_samples: list[dict[str, float]] = field(default_factory=list)
+    open_positions: dict[str, dict[str, float]] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> LiveRiskState:
+        if int(data.get("version", 0)) != LIVE_STATE_VERSION:
+            return cls()
+        known = set(cls.__dataclass_fields__)
+        return cls(**{k: v for k, v in data.items() if k in known})
+
+
+def default_live_state_path(policy: Policy) -> Path:
+    return Path(policy.execution.audit_log).expanduser().with_name("live_state.json")
+
+
+def load_live_risk_state(path: Path | str) -> LiveRiskState:
+    p = Path(path).expanduser()
+    if not p.exists():
+        return LiveRiskState()
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        return LiveRiskState.from_dict(raw if isinstance(raw, dict) else {})
+    except Exception:  # noqa: BLE001
+        return LiveRiskState()
+
+
+def save_live_risk_state(path: Path | str, state: LiveRiskState) -> None:
+    p = Path(path).expanduser()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".live_state_", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(state.to_dict(), fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, p)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def reset_live_risk_state(
+    policy: Policy,
+    *,
+    equity_usdt: float = 0.0,
+    state_path: Path | str | None = None,
+) -> LiveRiskState:
+    """Clear latched drawdown halt, loss streak cooldown, and reset peak equity."""
+    p = Path(state_path).expanduser() if state_path else default_live_state_path(policy)
+    state = load_live_risk_state(p)
+    state.peak_equity_usdt = round(equity_usdt, 2) if equity_usdt > 0 else 0.0
+    state.drawdown_pct = 0.0
+    state.drawdown_halted = False
+    state.daily_loss_pct = 0.0
+    state.daily_loss_halted = False
+    state.consecutive_losses = 0
+    state.last_loss_ts_ms = 0
+    state.cooldown_until_ms = 0
+    state.streak_cooldown_active = False
+    state.equity_samples = []
+    save_live_risk_state(p, state)
+    return state
+
+
+def evaluate_and_update_live_risk_state(
+    *,
+    policy: Policy,
+    equity_usdt: float,
+    live_positions: dict[str, dict[str, Any]],
+    latest_bar_ts: int = 0,
+    symbol_stops: dict[str, tuple[float, float, float]] | None = None,
+    rebalance_every: int = 5,
+    now_ms: int | None = None,
+    state_path: Path | str | None = None,
+    persist: bool = True,
+) -> LiveRiskState:
+    """Update peak equity, 24h PnL, loss streak, and 5-bar rebalance clock."""
+    now = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+    p = Path(state_path).expanduser() if state_path else default_live_state_path(policy)
+    state = load_live_risk_state(p)
+    stops_map = symbol_stops or {}
+
+    # 1. Peak equity & peak drawdown stop (latched until manual reset)
+    if equity_usdt > state.peak_equity_usdt:
+        state.peak_equity_usdt = round(equity_usdt, 2)
+    if state.peak_equity_usdt > 0:
+        state.drawdown_pct = round(
+            max(0.0, (state.peak_equity_usdt - equity_usdt) / state.peak_equity_usdt * 100.0),
+            2,
+        )
+    else:
+        state.drawdown_pct = 0.0
+    if drawdown_halt(state.peak_equity_usdt, equity_usdt, policy):
+        state.drawdown_halted = True
+
+    # 2. Rolling 24h loss halt
+    cutoff_7d = now - 7 * 86_400_000
+    cutoff_24h = now - 86_400_000
+    samples = [
+        s
+        for s in state.equity_samples
+        if isinstance(s, dict) and int(s.get("ts_ms", 0)) >= cutoff_7d
+    ]
+    older_or_at_24h = [s for s in samples if int(s["ts_ms"]) <= cutoff_24h]
+    in_last_24h = [s for s in samples if int(s["ts_ms"]) > cutoff_24h]
+    if older_or_at_24h:
+        ref_24h = float(older_or_at_24h[-1]["equity"])
+    elif in_last_24h:
+        ref_24h = max(float(s["equity"]) for s in in_last_24h)
+    else:
+        ref_24h = equity_usdt
+    state.equity_24h_ago_usdt = round(ref_24h, 2)
+    state.pnl_24h_usdt = round(equity_usdt - ref_24h, 2)
+    state.daily_loss_pct = (
+        round(max(0.0, -state.pnl_24h_usdt / ref_24h * 100.0), 2) if ref_24h > 0 else 0.0
+    )
+    state.daily_loss_halted = bool(daily_loss_halt(state.pnl_24h_usdt, ref_24h, policy))
+
+    if (
+        samples
+        and (now - int(samples[-1]["ts_ms"]) < 60_000)
+        and abs(float(samples[-1]["equity"]) - round(equity_usdt, 2)) < 1e-6
+    ):
+        samples[-1]["ts_ms"] = now
+    else:
+        samples.append({"ts_ms": now, "equity": round(equity_usdt, 2)})
+    state.equity_samples = samples[-256:]
+
+    # 3. Position outcomes & consecutive loss streak cooldown
+    if state.cooldown_until_ms > 0 and now >= state.cooldown_until_ms:
+        state.consecutive_losses = 0
+        state.cooldown_until_ms = 0
+        state.streak_cooldown_active = False
+
+    was_empty = len(state.open_positions) == 0
+    for inst_id, prev_info in list(state.open_positions.items()):
+        if inst_id in live_positions:
+            continue
+        entry_px = float(prev_info.get("entry_price") or 0.0)
+        exit_px = (
+            float(stops_map[inst_id][0])
+            if inst_id in stops_map
+            else float(prev_info.get("stop_price") or 0.0)
+        )
+        eq_entry = float(prev_info.get("equity_at_entry") or equity_usdt)
+        is_loss = (
+            (exit_px < entry_px)
+            if (exit_px > 0 and entry_px > 0)
+            else (equity_usdt < eq_entry - 0.05)
+        )
+        if is_loss:
+            state.consecutive_losses += 1
+            state.last_loss_ts_ms = now
+        else:
+            state.consecutive_losses = 0
+            state.cooldown_until_ms = 0
+        del state.open_positions[inst_id]
+
+    for inst_id, pos in live_positions.items():
+        qty = abs(float(pos.get("qty") or 0.0))
+        notional = float(pos.get("notional_usdt") or 0.0)
+        cur_px = (
+            notional / qty
+            if qty > 0 and notional > 0
+            else (float(stops_map[inst_id][0]) if inst_id in stops_map else 0.0)
+        )
+        if inst_id not in state.open_positions:
+            state.open_positions[inst_id] = {
+                "qty": qty,
+                "entry_price": round(cur_px, 6),
+                "last_price": round(cur_px, 6),
+                "stop_price": float(pos.get("stop_price") or 0.0),
+                "equity_at_entry": round(equity_usdt, 2),
+            }
+        else:
+            state.open_positions[inst_id]["qty"] = qty
+            if cur_px > 0:
+                state.open_positions[inst_id]["last_price"] = round(cur_px, 6)
+            state.open_positions[inst_id]["stop_price"] = float(pos.get("stop_price") or 0.0)
+
+    if streak_cooldown(state.consecutive_losses, policy):
+        if state.cooldown_until_ms <= 0:
+            anchor_ts = state.last_loss_ts_ms if state.last_loss_ts_ms > 0 else now
+            state.cooldown_until_ms = anchor_ts + int(policy.limits.cooldown_hours * 3_600_000)
+        state.streak_cooldown_active = now < state.cooldown_until_ms
+        if not state.streak_cooldown_active:
+            state.consecutive_losses = 0
+            state.cooldown_until_ms = 0
+    else:
+        state.streak_cooldown_active = False
+
+    # 4. 5-bar rebalance cadence alignment
+    eff_rebalance_every = max(1, int(rebalance_every))
+    if not live_positions:
+        state.bars_since_rebalance = eff_rebalance_every
+        state.rebalance_due = True
+    else:
+        if was_empty and state.last_rebalance_bar_ts <= 0 and latest_bar_ts > 0:
+            state.last_rebalance_bar_ts = latest_bar_ts
+        if state.last_rebalance_bar_ts <= 0 or latest_bar_ts <= 0:
+            state.bars_since_rebalance = eff_rebalance_every
+            state.rebalance_due = True
+        else:
+            elapsed = max(
+                0, int(round((latest_bar_ts - state.last_rebalance_bar_ts) / 86_400_000))
+            )
+            state.bars_since_rebalance = elapsed
+            state.rebalance_due = elapsed >= eff_rebalance_every
+
+    if persist:
+        save_live_risk_state(p, state)
+    return state
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,6 +592,53 @@ class ExecutionRunbook:
     steps: tuple[RunbookStep, ...]
     blocked_reason: str
     audit_hash: str
+    risk_state: LiveRiskState | None = None
+    entry_halt_reason: str = ""
+
+
+def _hold_order_for_live_position(
+    inst_id: str,
+    pos: dict[str, Any],
+    plan: ShadowPlan,
+    order_by_id: dict[str, ShadowOrder],
+) -> ShadowOrder:
+    """Build a hold-in-place ShadowOrder for an existing position between 5-bar rebalances."""
+    cur_qty = abs(float(pos.get("qty") or 0.0))
+    cur_notional = float(pos.get("notional_usdt") or 0.0)
+    wallet = str(pos.get("wallet") or ("future" if inst_id.endswith("-SWAP") else "spot"))
+    existing_order = order_by_id.get(inst_id)
+    if existing_order is not None:
+        ref_px = existing_order.ref_price
+        sd_pct = existing_order.stop_distance_pct
+        sp_val = existing_order.stop_price
+        score = existing_order.score
+        min_not = existing_order.min_notional_usdt
+    elif inst_id in plan.symbol_stops:
+        ref_px, sd_pct, sp_val = plan.symbol_stops[inst_id]
+        score = 0.0
+        min_not = 5.0
+    else:
+        ref_px = (cur_notional / cur_qty) if cur_qty > 0 else 0.0
+        sd_pct = 2.0
+        sp_val = float(pos.get("stop_price") or round(ref_px * 0.98, 6))
+        score = 0.0
+        min_not = 5.0
+    stop_payload = build_exchange_stop_payload(
+        inst_id, wallet=wallet, qty=cur_qty, stop_price=sp_val
+    )
+    return ShadowOrder(
+        inst_id=inst_id,
+        wallet=wallet,
+        score=score,
+        ref_price=ref_px,
+        stop_distance_pct=sd_pct,
+        stop_price=sp_val,
+        target_notional_usdt=round(cur_qty * ref_px, 2) if ref_px > 0 else cur_notional,
+        min_notional_usdt=min_not,
+        qty=cur_qty,
+        executable=True,
+        stop_order=stop_payload,
+    )
 
 
 def build_execution_runbook(
@@ -295,7 +647,10 @@ def build_execution_runbook(
     gateway: Any,
     plan: ShadowPlan,
     symbols: tuple[str, ...] | list[str] = (),
+    rebalance_every: int = 5,
     rebalance_drift_threshold: float = 0.10,
+    now_ms: int | None = None,
+    state_path: Path | str | None = None,
     persist_audit: bool = True,
 ) -> ExecutionRunbook:
     """Reconcile live wallets, Simple Earn, positions, and stops against ``plan``.
@@ -332,15 +687,70 @@ def build_execution_runbook(
         else {}
     )
 
+    eff_state_path = (
+        Path(state_path).expanduser() if state_path else default_live_state_path(policy)
+    )
+    risk_state = evaluate_and_update_live_risk_state(
+        policy=policy,
+        equity_usdt=plan.equity_usdt,
+        live_positions=live_pos,
+        latest_bar_ts=plan.latest_bar_ts,
+        symbol_stops=plan.symbol_stops,
+        rebalance_every=rebalance_every,
+        now_ms=now_ms,
+        state_path=eff_state_path,
+        persist=persist_audit,
+    )
+
     blocked = ""
+    entry_halt_reason = ""
     if plan.halted:
         blocked = "kill_switch_engaged"
     elif plan.below_floor:
         blocked = f"below_equity_floor_${policy.equity_floor_usdt:.2f}"
+    elif risk_state.drawdown_halted:
+        entry_halt_reason = (
+            f"peak_drawdown_halt_{risk_state.drawdown_pct:.1f}%_"
+            f">={policy.limits.peak_drawdown_stop_pct:.1f}%"
+        )
+    elif risk_state.daily_loss_halted:
+        entry_halt_reason = (
+            f"daily_loss_halt_{risk_state.daily_loss_pct:.1f}%_"
+            f">={policy.limits.daily_loss_halt_pct:.1f}%"
+        )
+    elif risk_state.streak_cooldown_active:
+        entry_halt_reason = f"streak_cooldown_{risk_state.consecutive_losses}_losses"
 
     steps: list[RunbookStep] = []
     if not blocked:
-        target_map = {o.inst_id: o for o in plan.orders if o.executable}
+        order_by_id = {o.inst_id: o for o in plan.orders if o.executable}
+        if risk_state.drawdown_halted:
+            # Peak drawdown stop (>= 18%) flattens all open positions to cash/Earn
+            target_map: dict[str, ShadowOrder] = {}
+        elif risk_state.daily_loss_halted or risk_state.streak_cooldown_active:
+            # Daily loss halt or streak cooldown blocks new entries/increases while
+            # keeping uptrend positions with stop ratcheting and exiting broken trends
+            target_map = {
+                inst_id: _hold_order_for_live_position(inst_id, pos, plan, order_by_id)
+                for inst_id, pos in sorted(live_pos.items())
+                if inst_id in plan.uptrend_symbols
+            }
+        elif not risk_state.rebalance_due and live_pos:
+            # Mid-cycle (bars 1..4 of 5-bar rebalance window): hold uptrending positions
+            # without rotational turnover or drift churn, while ratcheting stops upward
+            kept_map = {
+                inst_id: _hold_order_for_live_position(inst_id, pos, plan, order_by_id)
+                for inst_id, pos in sorted(live_pos.items())
+                if inst_id in plan.uptrend_symbols
+            }
+            if kept_map:
+                target_map = kept_map
+            else:
+                # All held positions broke their trend -> back in cash, allow new top-2
+                risk_state.rebalance_due = True
+                target_map = order_by_id
+        else:
+            target_map = order_by_id
 
         # Stage 1: Cancel stops & close positions not in target_map
         sim_spot = spot_free
@@ -418,6 +828,23 @@ def build_execution_runbook(
                 # Back each perpetual leg with ~50% margin collateral (2.0x effective leverage,
                 # keeping liquidation >45% away while leaving excess cash in Simple Earn)
                 req_future_margin += round(order.target_notional_usdt * 0.50, 2)
+
+        # If a scheduled 5-bar rebalance found existing positions already aligned (no trade needed),
+        # advance the rebalance bar clock now so the next 5-bar window begins cleanly.
+        has_trade_step = any(
+            s.action == "CLOSE_POSITION" for s in steps
+        ) or bool(entry_candidates)
+        if (
+            risk_state.rebalance_due
+            and live_pos
+            and target_map
+            and not has_trade_step
+            and plan.latest_bar_ts > 0
+        ):
+            risk_state.last_rebalance_bar_ts = plan.latest_bar_ts
+            risk_state.bars_since_rebalance = 0
+            if persist_audit:
+                save_live_risk_state(eff_state_path, risk_state)
 
         # Cap required future margin so Spot + Futures never exceed total available cash
         total_cash_avail = sim_spot + sim_future + earn_flex
@@ -573,6 +1000,9 @@ def build_execution_runbook(
                 )
             )
 
+    if entry_halt_reason and not steps:
+        blocked = entry_halt_reason
+
     audit_hash = ""
     if persist_audit:
         audit = AuditLog(policy.execution.audit_log)
@@ -584,6 +1014,13 @@ def build_execution_runbook(
                 "future_free_usdt": round(future_free, 2),
                 "earn_flexible_usdt": round(earn_flex, 2),
                 "blocked_reason": blocked,
+                "entry_halt_reason": entry_halt_reason,
+                "peak_equity_usdt": risk_state.peak_equity_usdt,
+                "drawdown_pct": risk_state.drawdown_pct,
+                "daily_loss_pct": risk_state.daily_loss_pct,
+                "consecutive_losses": risk_state.consecutive_losses,
+                "bars_since_rebalance": risk_state.bars_since_rebalance,
+                "rebalance_due": risk_state.rebalance_due,
                 "steps": [asdict(s) for s in steps],
             }
         )
@@ -598,6 +1035,8 @@ def build_execution_runbook(
         steps=tuple(steps),
         blocked_reason=blocked,
         audit_hash=audit_hash,
+        risk_state=risk_state,
+        entry_halt_reason=entry_halt_reason,
     )
 
 
@@ -793,6 +1232,16 @@ class OrderRouter:
                     "result": res,
                 }
             )
+
+        if runbook.plan.latest_bar_ts > 0 and any(
+            r["action"] in ("ENTRY_ORDER", "CLOSE_POSITION") for r in results
+        ):
+            st_path = default_live_state_path(self.policy)
+            st = load_live_risk_state(st_path)
+            st.last_rebalance_bar_ts = runbook.plan.latest_bar_ts
+            st.bars_since_rebalance = 0
+            st.rebalance_due = False
+            save_live_risk_state(st_path, st)
 
         audit = AuditLog(self.policy.execution.audit_log)
         digest = audit.append(

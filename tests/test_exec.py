@@ -339,3 +339,282 @@ def test_7_stage_execution_runbook_and_live_router_lifecycle(
     # Stage 7 subscribes freed Spot cash back into Simple Earn
     assert (7, "SUBSCRIBE_EARN", "USDT") in act2
     assert AuditLog(audit_file).verify() is True
+
+
+def test_circuit_breakers_and_5_bar_rebalance_cadence(
+    make_policy, monkeypatch, tmp_path
+) -> None:
+    import pandas as pd
+
+    from vito.exec import (
+        OrderRouter,
+        build_execution_runbook,
+        build_shadow_plan,
+        reset_live_risk_state,
+    )
+
+    audit_file = tmp_path / "audit.jsonl"
+    pol = make_policy(execution__mode="live", execution__audit_log=str(audit_file))
+    monkeypatch.setenv("VITO_LIVE", "1")
+
+    class DummyClient:
+        def create_order(self, symbol, otype, side, qty, price=None, params=None):
+            return {"id": "ord-1"}
+
+        def cancel_order(self, oid, symbol):
+            return {"id": oid}
+
+    class DummyGateway:
+        def __init__(self) -> None:
+            self.cli = DummyClient()
+            self.live_pos: dict = {}
+
+        def earn_info(self, asset: str = "USDT") -> dict:
+            return {"asset": asset, "amount": 90.0, "apr_pct": 10.22, "product_id": "USDT001"}
+
+        def min_notional(self, sym: str) -> float:
+            return 5.0
+
+        def wallet_usdt_breakdown(self) -> dict:
+            return {
+                "spot_free": 0.0,
+                "future_free": 0.0,
+                "earn_flexible": 90.0,
+                "product_id": "USDT001",
+                "earn_apr_pct": 10.22,
+            }
+
+        def live_positions_and_stops(self, symbols) -> dict:
+            return dict(self.live_pos)
+
+        def _market(self, inst_id: str) -> dict:
+            return {"symbol": inst_id, "type": "swap" if inst_id.endswith("-SWAP") else "spot"}
+
+        def _client_for(self, market: dict) -> DummyClient:
+            return self.cli
+
+        def redeem_earn(self, amount_usdt: float, *, product_id: str, dest_account: str):
+            return {"success": True}
+
+        def subscribe_earn(self, amount_usdt: float, *, product_id: str):
+            return {"success": True}
+
+        def transfer_usdt(self, amount_usdt: float, *, from_wallet: str, to_wallet: str):
+            return {"tranId": 1}
+
+    gw = DummyGateway()
+
+    def _frame(base_px: float, growth: float, start_ts: int) -> pd.DataFrame:
+        ts = [start_ts + i * 86_400_000 for i in range(30)]
+        vals = [base_px * (growth ** (i + (i % 2) * 0.05)) for i in range(30)]
+        return pd.DataFrame(
+            {
+                "timestamp": ts,
+                "open": vals,
+                "high": [v * 1.003 for v in vals],
+                "low": [v * 0.997 for v in vals],
+                "close": vals,
+                "volume": [1000.0] * 30,
+            }
+        )
+
+    t0 = 1_700_000_000_000
+    frames_d1 = {
+        "PAXG-USDT": _frame(3800.0, 1.006, t0),
+        "QQQ-USDT-SWAP": _frame(600.0, 1.005, t0),
+    }
+
+    # 1. Day 1: Enter PAXG-USDT + QQQ-USDT-SWAP at $100 equity; execute runbook to lock rebalance ts
+    plan1 = build_shadow_plan(
+        policy=pol,
+        gateway=gw,
+        frames=frames_d1,
+        equity_usdt=100.0,
+        cash_usdt=100.0,
+        max_exposure=1.25,
+    )
+    rb1 = build_execution_runbook(
+        policy=pol, gateway=gw, plan=plan1, symbols=tuple(frames_d1), now_ms=t0
+    )
+    assert rb1.risk_state is not None
+    assert rb1.risk_state.rebalance_due is True
+    router = OrderRouter(pol)
+    router.arm(pol.digest())
+    router.execute_runbook(rb1, gateway=gw)
+
+    paxg_o = next(o for o in plan1.orders if o.inst_id == "PAXG-USDT")
+    qqq_o = next(o for o in plan1.orders if o.inst_id == "QQQ-USDT-SWAP")
+    gw.live_pos = {
+        "PAXG-USDT": {
+            "inst_id": "PAXG-USDT",
+            "wallet": "spot",
+            "qty": paxg_o.qty,
+            "notional_usdt": paxg_o.target_notional_usdt,
+            "stop_price": paxg_o.stop_price - 20.0,
+            "stop_order_id": "s-paxg",
+        },
+        "QQQ-USDT-SWAP": {
+            "inst_id": "QQQ-USDT-SWAP",
+            "wallet": "future",
+            "qty": qqq_o.qty,
+            "notional_usdt": qqq_o.target_notional_usdt,
+            "stop_price": qqq_o.stop_price,
+            "stop_order_id": "s-qqq",
+        },
+    }
+
+    # 2. Day 3 (2 bars elapsed < 5): BTC-USDT now outscores PAXG-USDT, but both held assets are
+    #    still in uptrend -> must NOT rotate into BTC-USDT mid-cycle; only ratchet PAXG stop!
+    t_day3 = t0 + 2 * 86_400_000
+    frames_d3 = {
+        "BTC-USDT": _frame(70000.0, 1.012, t_day3),
+        "PAXG-USDT": _frame(3800.0, 1.006, t_day3),
+        "QQQ-USDT-SWAP": _frame(600.0, 1.005, t_day3),
+    }
+    plan3 = build_shadow_plan(
+        policy=pol,
+        gateway=gw,
+        frames=frames_d3,
+        equity_usdt=101.0,
+        cash_usdt=50.0,
+        max_exposure=1.25,
+    )
+    rb3 = build_execution_runbook(
+        policy=pol, gateway=gw, plan=plan3, symbols=tuple(frames_d3), now_ms=t_day3
+    )
+    assert rb3.risk_state is not None
+    assert rb3.risk_state.bars_since_rebalance == 2
+    assert rb3.risk_state.rebalance_due is False
+    acts3 = [(s.stage, s.action, s.inst_id) for s in rb3.steps]
+    assert not any(a in ("CLOSE_POSITION", "ENTRY_ORDER") for _, a, _ in acts3)
+    assert (6, "PLACE_STOP", "PAXG-USDT") in acts3
+
+    # 3. Day 6 (5 bars elapsed >= 5): 5-bar rebalance window arrives -> rotates PAXG -> BTC-USDT
+    t_day6 = t0 + 5 * 86_400_000
+    frames_d6 = {
+        "BTC-USDT": _frame(70000.0, 1.012, t_day6),
+        "PAXG-USDT": _frame(3800.0, 1.006, t_day6),
+        "QQQ-USDT-SWAP": _frame(600.0, 1.005, t_day6),
+    }
+    plan6 = build_shadow_plan(
+        policy=pol,
+        gateway=gw,
+        frames=frames_d6,
+        equity_usdt=102.0,
+        cash_usdt=50.0,
+        max_exposure=1.25,
+    )
+    rb6 = build_execution_runbook(
+        policy=pol, gateway=gw, plan=plan6, symbols=tuple(frames_d6), now_ms=t_day6
+    )
+    assert rb6.risk_state is not None
+    assert rb6.risk_state.bars_since_rebalance == 5
+    assert rb6.risk_state.rebalance_due is True
+    acts6 = [(s.stage, s.action, s.inst_id) for s in rb6.steps]
+    assert (1, "CLOSE_POSITION", "PAXG-USDT") in acts6
+    assert (5, "ENTRY_ORDER", "BTC-USDT") in acts6
+
+    # 4. Daily loss halt (4.5% rolling 24h loss): equity drops from $102.00 to $96.50 (-5.39%)
+    gw.live_pos = {}
+    plan_dl = build_shadow_plan(
+        policy=pol, gateway=gw, frames=frames_d6, equity_usdt=96.5, cash_usdt=96.5
+    )
+    rb_dl = build_execution_runbook(
+        policy=pol,
+        gateway=gw,
+        plan=plan_dl,
+        symbols=tuple(frames_d6),
+        now_ms=t_day6 + 3_600_000,
+    )
+    assert rb_dl.risk_state is not None
+    assert rb_dl.risk_state.daily_loss_halted is True
+    assert rb_dl.blocked_reason.startswith("daily_loss_halt_")
+    assert len(rb_dl.steps) == 0
+
+    # 5. Peak drawdown halt (18.0% from peak $102.00 -> $82.00 = 19.6% DD): latches until reset
+    plan_dd = build_shadow_plan(
+        policy=pol, gateway=gw, frames=frames_d6, equity_usdt=82.0, cash_usdt=82.0
+    )
+    rb_dd = build_execution_runbook(
+        policy=pol,
+        gateway=gw,
+        plan=plan_dd,
+        symbols=tuple(frames_d6),
+        now_ms=t_day6 + 2 * 86_400_000,
+    )
+    assert rb_dd.risk_state is not None
+    assert rb_dd.risk_state.drawdown_halted is True
+    assert rb_dd.blocked_reason.startswith("peak_drawdown_halt_")
+    # Stays latched even if equity bounces to $90 (11.8% DD)
+    plan_bounce = build_shadow_plan(
+        policy=pol, gateway=gw, frames=frames_d6, equity_usdt=90.0, cash_usdt=90.0
+    )
+    rb_bounce = build_execution_runbook(
+        policy=pol,
+        gateway=gw,
+        plan=plan_bounce,
+        symbols=tuple(frames_d6),
+        now_ms=t_day6 + 4 * 86_400_000,
+    )
+    assert rb_bounce.blocked_reason.startswith("peak_drawdown_halt_")
+
+    # Manual reset clears the latched halt and resets peak equity
+    reset_live_risk_state(pol, equity_usdt=90.0)
+    rb_after_reset = build_execution_runbook(
+        policy=pol,
+        gateway=gw,
+        plan=plan_bounce,
+        symbols=tuple(frames_d6),
+        now_ms=t_day6 + 4 * 86_400_000 + 60_000,
+    )
+    assert rb_after_reset.blocked_reason == ""
+    assert any(s.action == "ENTRY_ORDER" for s in rb_after_reset.steps)
+
+    # 6. Loss streak cooldown (4 consecutive losing exits -> 24h pause, auto-expires after 24h)
+    base_ts = t_day6 + 10 * 86_400_000
+    reset_live_risk_state(pol, equity_usdt=100.0)
+    for k in range(4):
+        step_ts = base_ts + k * 2 * 86_400_000
+        gw.live_pos = {
+            "QQQ-USDT-SWAP": {
+                "inst_id": "QQQ-USDT-SWAP",
+                "wallet": "future",
+                "qty": 0.10,
+                "notional_usdt": 100.0,  # entry_price = 1000.0 > current close (~730) -> loss
+                "stop_price": 700.0,
+                "stop_order_id": f"s-{k}",
+            }
+        }
+        build_execution_runbook(
+            policy=pol,
+            gateway=gw,
+            plan=plan_bounce,
+            symbols=tuple(frames_d6),
+            now_ms=step_ts,
+        )
+        # Position stops out before next check
+        gw.live_pos = {}
+        rb_loss = build_execution_runbook(
+            policy=pol,
+            gateway=gw,
+            plan=plan_bounce,
+            symbols=tuple(frames_d6),
+            now_ms=step_ts + 3_600_000,
+        )
+    assert rb_loss.risk_state is not None
+    assert rb_loss.risk_state.consecutive_losses == 4
+    assert rb_loss.risk_state.streak_cooldown_active is True
+    assert rb_loss.blocked_reason == "streak_cooldown_4_losses"
+
+    # After 25 hours, the 24h cooldown expires automatically
+    rb_expired = build_execution_runbook(
+        policy=pol,
+        gateway=gw,
+        plan=plan_bounce,
+        symbols=tuple(frames_d6),
+        now_ms=step_ts + 26 * 3_600_000,
+    )
+    assert rb_expired.risk_state is not None
+    assert rb_expired.risk_state.streak_cooldown_active is False
+    assert rb_expired.risk_state.consecutive_losses == 0
+    assert rb_expired.blocked_reason == ""

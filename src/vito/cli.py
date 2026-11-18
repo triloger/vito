@@ -54,6 +54,7 @@ from vito.exec import (
     OrderRouter,
     build_execution_runbook,
     build_shadow_plan,
+    reset_live_risk_state,
 )
 from vito.network import EgressStatus, check_egress, fetch_egress_ip
 from vito.paper import PaperBroker, PaperPanelBroker, load_state
@@ -1672,6 +1673,9 @@ def cmd_execute(args: argparse.Namespace) -> int:
         equity_usdt = float(args.equity)
         cash_usdt = float(args.equity)
 
+    if getattr(args, "reset_halt", False):
+        reset_live_risk_state(policy, equity_usdt=equity_usdt)
+
     frames = {}
     with console.status(
         f"reconciling {len(symbols)} instruments ({args.timeframe}) against "
@@ -1690,6 +1694,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
         raw_mpg = getattr(args, "max_per_group", 1)
         max_per_group = int(raw_mpg) if (raw_mpg is not None and int(raw_mpg) > 0) else None
         index_gear = float(getattr(args, "index_gear", 1.0))
+        reb_every = int(getattr(args, "rebalance_every", 5) or 5)
         plan = build_shadow_plan(
             policy=policy,
             gateway=gateway,
@@ -1709,6 +1714,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
             gateway=gateway,
             plan=plan,
             symbols=symbols,
+            rebalance_every=reb_every,
         )
 
     exec_result = None
@@ -1753,6 +1759,31 @@ def cmd_execute(args: argparse.Namespace) -> int:
         f"Simple Earn ({runbook.earn_product_id}): "
         f"[green]${runbook.earn_flexible_usdt:.2f}[/green] @ {plan.earn_apr_pct:.2f}% APR"
     )
+    if runbook.risk_state is not None:
+        rs = runbook.risk_state
+        lim = policy.limits
+        reb_every = int(getattr(args, "rebalance_every", 5) or 5)
+        cadence_str = (
+            "[green]READY (cash)[/green]"
+            if not runbook.live_positions
+            else (
+                f"[green]REBALANCE DUE ({rs.bars_since_rebalance}/{reb_every}d)[/green]"
+                if rs.rebalance_due
+                else f"[cyan]HOLD & RATCHET ({rs.bars_since_rebalance}/{reb_every}d)[/cyan]"
+            )
+        )
+        console.print(
+            f"  breakers · Peak: [bold]${rs.peak_equity_usdt:.2f}[/bold] "
+            f"(DD {rs.drawdown_pct:.1f}%/{lim.peak_drawdown_stop_pct:.0f}%) · "
+            f"24h Loss: {rs.daily_loss_pct:.1f}%/{lim.daily_loss_halt_pct:.1f}% · "
+            f"Streak: {rs.consecutive_losses}/{lim.loss_streak_cooldown} · "
+            f"Cadence: {cadence_str}"
+        )
+        if runbook.entry_halt_reason and not runbook.blocked_reason:
+            console.print(
+                f"  [yellow]ENTRY BREAKER ACTIVE ({runbook.entry_halt_reason}): "
+                "new buys blocked; exits, stop ratchets, and Earn sweeps allowed[/yellow]"
+            )
 
     if runbook.blocked_reason:
         console.print(f"  [red]BLOCKED: {runbook.blocked_reason}[/red]")
@@ -1991,6 +2022,7 @@ def build_parser() -> argparse.ArgumentParser:
     execute.add_argument("--symbols", default=",".join(DEFAULT_BASKET))
     execute.add_argument("--timeframe", default="1d", choices=sorted(TIMEFRAME_MS))
     execute.add_argument("--lookback", type=int, default=20)
+    execute.add_argument("--rebalance-every", type=int, default=5)
     execute.add_argument("--max-positions", type=int, default=2)
     execute.add_argument("--max-per-group", type=int, default=1)
     execute.add_argument("--risk-pct", type=float, default=4.0)
@@ -1998,6 +2030,11 @@ def build_parser() -> argparse.ArgumentParser:
     execute.add_argument("--index-gear", type=float, default=1.0)
     execute.add_argument("--bars", type=int, default=250)
     execute.add_argument("--equity", type=float, default=200.0)
+    execute.add_argument(
+        "--reset-halt",
+        action="store_true",
+        help="clear latched peak-drawdown halt, loss streak cooldown, and reset peak equity",
+    )
     execute.add_argument(
         "--arm",
         default=None,
